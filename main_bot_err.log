@@ -1,0 +1,77 @@
+Traceback (most recent call last):
+  File "/Users/tmkd/Desktop/tmkd/FindexHub/main.py", line 4, in <module>
+    from findex_bot.bot import main as bot_main
+ModuleNotFoundError: No module named 'findex_bot.bot'
+Traceback (most recent call last):
+  File "/Users/tmkd/Desktop/tmkd/FindexHub/main.py", line 4, in <module>
+    from findex_bot.bot import main as bot_main
+ModuleNotFoundError: No module named 'findex_bot.bot'
+Traceback (most recent call last):
+  File "/Users/tmkd/Desktop/tmkd/FindexHub/main.py", line 4, in <module>
+    from findex_bot.bot import main as bot_main
+ModuleNotFoundError: No module named 'findex_bot.bot'
+Traceback (most recent call last):
+  File "/Users/tmkd/Desktop/tmkd/FindexHub/main.py", line 4, in <module>
+    from findex_bot.bot import main as bot_main
+ModuleNotFoundError: No module named 'findex_bot.bot'
+INFO:root:Бот запущен
+INFO:aiogram.dispatcher:Start polling
+INFO:aiogram.dispatcher:Run polling for bot @findex_hub_bot id=8282404723 - 'Findex Hub Bot'
+INFO:aiogram.event:Update id=121466895 is handled. Duration 1221 ms by bot id=8282404723
+WARNING:aiogram.dispatcher:Received SIGTERM signal
+INFO:aiogram.dispatcher:Polling stopped for bot @findex_hub_bot id=8282404723 - 'Findex Hub Bot'
+INFO:aiogram.dispatcher:Polling stopped
+INFO:root:Бот запущен
+INFO:aiogram.dispatcher:Start polling
+INFO:aiogram.dispatcher:Run polling for bot @findex_hub_bot id=8282404723 - 'Findex Hub Bot'
+INFO:aiogram.event:Update id=121466896 is handled. Duration 381 ms by bot id=8282404723
+INFO:aiogram.event:Update id=121466897 is handled. Duration 292 ms by bot id=8282404723
+INFO:aiogram.event:Update id=121466898 is handled. Duration 2 ms by bot id=8282404723
+INFO:aiogram.event:Update id=121466899 is handled. Duration 79 ms by bot id=8282404723
+INFO:aiogram.event:Update id=121466900 is handled. Duration 150 ms by bot id=8282404723
+INFO:aiogram.event:Update id=121466901 is handled. Duration 124 ms by bot id=8282404723
+WARNING:aiogram.dispatcher:Received SIGTERM signal
+INFO:aiogram.dispatcher:Polling stopped for bot @findex_hub_bot id=8282404723 - 'Findex Hub Bot'
+INFO:aiogram.dispatcher:Polling stopped
+INFO:root:Бот запущен
+INFO:aiogram.dispatcher:Start polling
+INFO:aiogram.dispatcher:Run polling for bot @findex_hub_bot id=8282404723 - 'Findex Hub Bot'
+INFO:aiogram.event:Update id=121466902 is handled. Duration 616 ms by bot id=8282404723
+INFO:aiogram.event:Update id=121466903 is handled. Duration 256 ms by bot id=8282404723
+INFO:aiogram.event:Update id=121466904 is handled. Duration 3 ms by bot id=8282404723
+ERROR:aiogram.dispatcher:Failed to fetch updates - TelegramNetworkError: HTTP Client says - ClientOSError: [Errno 54] Connection reset by peer
+WARNING:aiogram.dispatcher:Sleep for 1.000000 seconds and try again... (tryings = 0, bot id = 8282404723)
+INFO:aiogram.dispatcher:Connection established (tryings = 1, bot id = 8282404723)
+ERROR:aiogram.dispatcher:Failed to fetch updates - TelegramNetworkError: HTTP Client says - ClientOSError: [Errno 54] Connection reset by peer
+WARNING:aiogram.dispatcher:Sleep for 1.000000 seconds and try again... (tryings = 0, bot id = 8282404723)
+INFO:aiogram.dispatcher:Connection established (tryings = 1, bot id = 8282404723)
+ERROR:aiogram.dispatcher:Failed to fetch updates - TelegramNetworkError: HTTP Client says - ClientOSError: [Errno 54] Connection reset by peer
+WARNING:aiogram.dispatcher:Sleep for 1.000000 seconds and try again... (tryings = 0, bot id = 8282404723)
+INFO:aiogram.dispatcher:Connection established (tryings = 1, bot id = 8282404723)
+WARNING:aiogram.dispatcher:Received SIGTERM signal
+INFO:aiogram.dispatcher:Polling stopped for bot @findex_hub_bot id=8282404723 - 'Findex Hub Bot'
+INFO:aiogram.dispatcher:Polling stopped
+INFO:root:Бот запущен
+INFO:aiogram.dispatcher:Start polling
+INFO:aiogram.dispatcher:Run polling for bot @findex_hub_bot id=8282404723 - 'Findex Hub Bot'
+INFO:aiogram.event:Update id=121466905 is handled. Duration 490 ms by bot id=8282404723
+INFO:aiogram.event:Update id=121466906 is handled. Duration 329 ms by bot id=8282404723
+INFO:aiogram.event:Update id=121466907 is handled. Duration 2 ms by bot id=8282404723
+WARNING:aiogram.dispatcher:Received SIGTERM signal
+INFO:aiogram.dispatcher:Polling stopped for bot @findex_hub_bot id=8282404723 - 'Findex Hub Bot'
+INFO:aiogram.dispatcher:Polling stopped
+INFO:root:Бот запущен
+INFO:aiogram.dispatcher:Start polling
+INFO:aiogram.dispatcher:Run polling for bot @findex_hub_bot id=8282404723 - 'Findex Hub Bot'
+INFO:aiogram.event:Update id=121466908 is handled. Duration 882 ms by bot id=8282404723
+INFO:aiogram.event:Update id=121466909 is handled. Duration 227 ms by bot id=8282404723
+INFO:aiogram.event:Update id=121466910 is handled. Duration 3 ms by bot id=8282404723
+INFO:aiogram.event:Update id=121466911 is handled. Duration 225 ms by bot id=8282404723
+INFO:aiogram.event:Update id=121466912 is handled. Duration 877 ms by bot id=8282404723
+INFO:aiogram.event:Update id=121466913 is handled. Duration 5 ms by bot id=8282404723
+INFO:aiogram.event:Update id=121466914 is handled. Duration 153 ms by bot id=8282404723
+INFO:aiogram.event:Update id=121466915 is handled. Duration 250 ms by bot id=8282404723
+INFO:aiogram.event:Update id=121466916 is handled. Duration 3 ms by bot id=8282404723
+ERROR:aiogram.dispatcher:Failed to fetch updates - TelegramNetworkError: HTTP Client says - Request timeout error
+WARNING:aiogram.dispatcher:Sleep for 1.000000 seconds and try again... (tryings = 0, bot id = 8282404723)
+INFO:aiogram.dispatcher:Connection established (tryings = 1, bot id = 8282404723)
