@@ -343,6 +343,12 @@ async def edit_after_reject(callback: CallbackQuery, state: FSMContext):
 @router.message(SeekerForm.contacts)
 @router.message(SeekerForm.description)
 async def edit_field_after_reject_seeker(message: Message, state: FSMContext):
+    data = await state.get_data()
+    
+    # Только обрабатываем, если это редактирование после отклонения
+    if not data.get("is_inline_edit"):
+        return
+    
     current_state = await state.get_state()
     field = None
     next_state = None
@@ -363,12 +369,9 @@ async def edit_field_after_reject_seeker(message: Message, state: FSMContext):
         return
 
     await state.update_data(**{field: (message.text or "").strip()})
-    data = await state.get_data()
-
-    if data.get("is_inline_edit"):
-        await state.update_data(is_inline_edit=False)
-        await state.set_state(next_state)
-        await send_preview(message, state, message.bot)
+    await state.update_data(is_inline_edit=False)
+    await state.set_state(next_state)
+    await send_preview(message, state, message.bot)
 
 
 # ------ ОДОБРЕНИЕ (ПУБЛИКАЦИЯ) ОБЪЯВЛЕНИЯ ------
