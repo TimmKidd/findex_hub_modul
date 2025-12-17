@@ -1,449 +1,665 @@
+# === forms.py ===
+from __future__ import annotations
+
+import uuid
+import logging
+from typing import Optional, Tuple
+
 from aiogram import Router, F
+from aiogram.enums import ParseMode
+from aiogram.fsm.context import FSMContext
 from aiogram.types import (
     CallbackQuery,
-    Message,
     InlineKeyboardMarkup,
     InlineKeyboardButton,
-    ReplyKeyboardRemove,
+    LinkPreviewOptions,
 )
-from aiogram.fsm.context import FSMContext
-from aiogram.enums import ParseMode
 
-from findex_bot.states.vacancies import EmployerForm, SeekerForm, ModRejectionForm
-from findex_bot.utils.vacancy_utils import get_ad_text
+from findex_bot.states.vacancies import EmployerForm, SeekerForm
 from findex_bot.utils.ui_utils import (
     moderation_keyboard,
     rejection_keyboard,
     send_ad_preview,
-    send_preview,
+    get_full_edit_keyboard,
+    NOOP_CALLBACK,
 )
+
+logger = logging.getLogger(__name__)
 
 router = Router()
 
+# ------------------------------------------------------
+# SAFE ANSWER / SAFE EDIT
+# ------------------------------------------------------
 
-# ------ ОТКЛОНЕНИЕ: переход от кнопки "Отклонить" к выбору причины ------
+
+async def _safe_answer(callback: CallbackQuery, text: str | None = None, show_alert: bool = False):
+    try:
+        if text is None:
+            await callback.answer()
+        else:
+            await callback.answer(text, show_alert=show_alert)
+    except Exception:
+        pass
+
+
+async def _safe_edit(
+    callback: CallbackQuery,
+    text: str,
+    reply_markup: InlineKeyboardMarkup | None = None,
+    parse_mode: ParseMode | None = None,
+    disable_preview: bool = False,
+    allow_fallback: bool = True,  # allow_fallback=False → не создаём новое сообщение (важно для мод-чата)
+):
+    msg = callback.message
+    try:
+        # Текстовое сообщение
+        if getattr(msg, "text", None):
+            return await msg.edit_text(
+                text,
+                reply_markup=reply_markup,
+                parse_mode=parse_mode,
+                link_preview_options=LinkPreviewOptions(is_disabled=True) if disable_preview else None,
+            )
+
+        # Фото/видео сообщение (caption)
+        if getattr(msg, "caption", None) is not None:
+            return await msg.edit_caption(
+                caption=text,
+                reply_markup=reply_markup,
+                parse_mode=parse_mode,
+            )
+    except Exception:
+        if not allow_fallback:
+            return None
+
+    if allow_fallback:
+        try:
+            return await callback.bot.send_message(
+                chat_id=msg.chat.id,
+                text=text,
+                reply_markup=reply_markup,
+                parse_mode=parse_mode,
+                link_preview_options=LinkPreviewOptions(is_disabled=True) if disable_preview else None,
+            )
+        except Exception:
+            return None
+
+
+def _get_msg_text_or_caption(callback: CallbackQuery) -> str:
+    msg = callback.message
+    return (getattr(msg, "text", None) or getattr(msg, "caption", None) or "").strip()
+
+
+def _append_once(base: str, add: str) -> str:
+    add_clean = (add or "").strip()
+    if not add_clean:
+        return base
+    if add_clean in (base or ""):
+        return base
+    return f"{base.rstrip()}\n\n{add_clean}" if (base or "").strip() else add_clean
+
+
+# ------------------------------------------------------
+# CORE ACCESS
+# ------------------------------------------------------
+
+
+def _core():
+    # ВАЖНО: импорт внутри функции — так мы избегаем циклических импортов
+    from findex_bot import bot
+    return bot
+
+
+def _get_pending_storage():
+    c = _core()
+    c.ADS_PENDING = getattr(c, "ADS_PENDING", {}) or {}
+    return c.ADS_PENDING
+
+
+def _get_rejected_storage():
+    c = _core()
+    c.ADS_REJECTED = getattr(c, "ADS_REJECTED", {}) or {}
+    return c.ADS_REJECTED
+
+
+def _get_published_storage():
+    """
+    В bot.py у тебя это называется PUBLISHED_POSTS.
+    Делаем совместимо: если где-то раньше было ADS_PUBLISHED — тоже поддержим.
+    """
+    c = _core()
+    if hasattr(c, "PUBLISHED_POSTS"):
+        c.PUBLISHED_POSTS = getattr(c, "PUBLISHED_POSTS", {}) or {}
+        return c.PUBLISHED_POSTS
+    c.ADS_PUBLISHED = getattr(c, "ADS_PUBLISHED", {}) or {}
+    return c.ADS_PUBLISHED
+
+
+def _get_mod_chat_id() -> Optional[int]:
+    try:
+        return int(_core().config.moderation_chat_id)
+    except Exception:
+        return None
+
+
+def _get_main_channel_id() -> Optional[int]:
+    try:
+        return int(_core().config.main_channel_id)
+    except Exception:
+        return None
+
+
+def _get_channel_username() -> str:
+    try:
+        return (_core().config.channel_username or "").lstrip("@")
+    except Exception:
+        return ""
+
+
+# ------------------------------------------------------
+# LIMITS (3 бесплатных в день) — БЕЗ циклического импорта
+# ------------------------------------------------------
+
+
+def _limits_record_published(user_id: int) -> int | str | None:
+    """
+    Увеличивает счётчик ТОЛЬКО после успешной публикации.
+    Возвращает сколько осталось (0..3) или "∞".
+    """
+    try:
+        c = _core()
+        fn = getattr(c, "record_published", None)
+        if callable(fn):
+            return fn(int(user_id))
+    except Exception:
+        logger.exception("LIMITS: record_published failed user_id=%s", user_id)
+    return None
+
+
+def _limits_get_remaining(user_id: int) -> int | str | None:
+    """Сколько осталось сегодня (не увеличивает)."""
+    try:
+        c = _core()
+        fn = getattr(c, "get_remaining_today", None)
+        if callable(fn):
+            return fn(int(user_id))
+    except Exception:
+        logger.exception("LIMITS: get_remaining_today failed user_id=%s", user_id)
+    return None
+
+
+# ------------------------------------------------------
+# PARSERS
+# ------------------------------------------------------
+
+
+def _parse_ad_id(data: str) -> Optional[str]:
+    """
+    Поддержка:
+    mod_approve:<ad_id>
+    mod_reject:<ad_id>
+    open_post:<ad_id>
+    а также варианты с | и _
+    """
+    if not data:
+        return None
+    for sep in (":", "|", "_"):
+        if sep in data:
+            p = data.split(sep, 1)
+            if len(p) == 2 and p[1].strip():
+                return p[1].strip()
+    return None
+
+
+def _parse_mod_reason(data: str) -> Tuple[Optional[str], Optional[str]]:
+    """
+    mod_reason:<ad_id>:<field>
+    """
+    if not data or not data.startswith("mod_reason:"):
+        return None, None
+    parts = data.split(":")
+    if len(parts) >= 3:
+        return (parts[1].strip() or None, parts[2].strip() or None)
+    return None, None
+
+
+# ------------------------------------------------------
+# UI: LOCKED KEYBOARD (после отправки на модерацию)
+# ------------------------------------------------------
+
+
+def _locked_keyboard() -> InlineKeyboardMarkup:
+    # Одна кнопка-заглушка, остальные кнопки исчезают → редактирование невозможно
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="⏳ Объявление отправлено на модерацию", callback_data=NOOP_CALLBACK)]
+        ]
+    )
+
+
+# ------------------------------------------------------
+# NOOP (кнопка заблокирована)
+# ------------------------------------------------------
+
+
+@router.callback_query(F.data == NOOP_CALLBACK)
+async def noop_callback(callback: CallbackQuery):
+    await _safe_answer(callback, "⏳ Уже отправлено на модерацию", show_alert=True)
+
+
+# ------------------------------------------------------
+# SEND TO MODERATION (ANTI-SPAM + сохраняем полный предпросмотр)
+# ------------------------------------------------------
+
+
+@router.callback_query(F.data.in_(["seek_send_mod", "emp_send_mod"]))
+async def send_to_moderation(callback: CallbackQuery, state: FSMContext):
+    await _safe_answer(callback)
+
+    data = await state.get_data()
+    if data.get("on_moderation"):
+        await _safe_answer(callback, "⏳ Уже отправлено на модерацию", show_alert=True)
+        return
+
+    mod_chat_id = _get_mod_chat_id()
+    if not mod_chat_id:
+        return
+
+    ad_id = uuid.uuid4().hex[:12]
+
+    payload = dict(data)
+    payload["author_id"] = callback.from_user.id
+
+    # сохраняем, какое сообщение у пользователя является предпросмотром (чтобы потом обновить ЕГО)
+    payload["user_chat_id"] = callback.from_user.id
+    payload["user_message_id"] = callback.message.message_id
+    payload["user_has_caption"] = (getattr(callback.message, "caption", None) is not None)
+
+    role = payload.get("role", "Работодатель")
+    payload["role"] = role
+
+    _get_pending_storage()[ad_id] = payload
+
+    # 1) в мод-чат — полноценная карточка
+    await send_ad_preview(
+        chat_id=mod_chat_id,
+        ad_data=payload,
+        bot=callback.bot,
+        reply_markup=moderation_keyboard(ad_id),
+    )
+
+    # 2) блокируем повторную отправку
+    await state.update_data(on_moderation=True)
+
+    # 3) У пользователя: ЛОЧИМ ВСЕ КНОПКИ ОДНОЙ ЗАГЛУШКОЙ (по задаче)
+    original_text = _get_msg_text_or_caption(callback)
+    if not original_text:
+        try:
+            from findex_bot.utils.vacancy_utils import get_ad_text
+            original_text = get_ad_text(payload, include_author=False)
+        except Exception:
+            original_text = "⏳ Объявление отправлено на модерацию"
+
+    await _safe_edit(
+        callback,
+        original_text,
+        reply_markup=_locked_keyboard(),
+        parse_mode=ParseMode.HTML,
+        disable_preview=True,
+        allow_fallback=True,  # пользователю можно fallback
+    )
+
+
+# ------------------------------------------------------
+# MODERATION: APPROVE
+# ------------------------------------------------------
+
+
+@router.callback_query(F.data.startswith("mod_approve"))
+async def mod_approve_callback(callback: CallbackQuery, state: FSMContext):
+    await _safe_answer(callback)
+
+    ad_id = _parse_ad_id(callback.data or "")
+    if not ad_id:
+        return
+
+    pending = _get_pending_storage()
+    ad = pending.get(ad_id)
+    if not ad:
+        return
+
+    main_channel = _get_main_channel_id()
+    if not main_channel:
+        return
+
+    # текст объявления
+    try:
+        from findex_bot.utils.vacancy_utils import get_ad_text
+        text = get_ad_text(ad, include_author=False)
+    except Exception:
+        text = ""
+
+    # публикуем (с медиа, если оно есть)
+    media_id = ad.get("media_id")
+    media_type = ad.get("media_type")
+
+    if media_id and media_type == "photo":
+        sent = await callback.bot.send_photo(
+            chat_id=main_channel,
+            photo=media_id,
+            caption=text,
+            parse_mode=ParseMode.HTML,
+        )
+    elif media_id and media_type == "video":
+        sent = await callback.bot.send_video(
+            chat_id=main_channel,
+            video=media_id,
+            caption=text,
+            parse_mode=ParseMode.HTML,
+        )
+    else:
+        sent = await callback.bot.send_message(
+            chat_id=main_channel,
+            text=text,
+            parse_mode=ParseMode.HTML,
+        )
+
+    username = _get_channel_username()
+    url = f"https://t.me/{username}/{sent.message_id}" if username else ""
+
+    _get_published_storage()[ad_id] = {
+        "chat_id": main_channel,
+        "message_id": sent.message_id,
+        "url": url,
+    }
+
+    # ✅ фиксируем лимит ПОСЛЕ успешной публикации
+    author_id = ad.get("author_id") or ad.get("user_chat_id")
+    remaining_after = None
+    if author_id:
+        remaining_after = _limits_record_published(int(author_id))
+
+    # --------------------------------------------------
+    # 1) ОБНОВЛЯЕМ ПРЕДПРОСМОТР У ПОЛЬЗОВАТЕЛЯ (В ЭТОМ ЖЕ СООБЩЕНИИ)
+    #    reply_markup=None (после публикации кнопки не нужны)
+    # --------------------------------------------------
+    try:
+        user_chat_id = ad.get("user_chat_id") or ad.get("author_id")
+        user_message_id = ad.get("user_message_id")
+        user_has_caption = bool(ad.get("user_has_caption"))
+
+        parts = []
+        parts.append("✅ <b>Опубликовано</b>")
+
+        if url:
+            parts.append(f"🔗 Ссылка: {url}")
+
+        if remaining_after is None and user_chat_id:
+            remaining_after = _limits_get_remaining(int(user_chat_id))
+
+        if remaining_after is not None:
+            if remaining_after == "∞":
+                parts.append("📩 Бесплатные публикации сегодня: ∞")
+            else:
+                parts.append(f"📩 Бесплатные публикации сегодня: {int(remaining_after)}/3")
+
+        parts.append("ℹ️ Чтобы создать новое объявление — нажми /start")
+
+        status_user = "\n\n" + "\n\n".join(parts)
+        final_text = (text or "").strip() + status_user
+
+        if user_chat_id and user_message_id:
+            if user_has_caption:
+                await callback.bot.edit_message_caption(
+                    chat_id=int(user_chat_id),
+                    message_id=int(user_message_id),
+                    caption=final_text,
+                    parse_mode=ParseMode.HTML,
+                    reply_markup=None,
+                )
+            else:
+                await callback.bot.edit_message_text(
+                    chat_id=int(user_chat_id),
+                    message_id=int(user_message_id),
+                    text=final_text,
+                    parse_mode=ParseMode.HTML,
+                    reply_markup=None,
+                    link_preview_options=LinkPreviewOptions(is_disabled=True),
+                )
+    except Exception:
+        logger.exception(
+            "APPROVE: failed to update user preview ad_id=%s user_chat_id=%s user_message_id=%s user_has_caption=%s",
+            ad_id,
+            ad.get("user_chat_id"),
+            ad.get("user_message_id"),
+            ad.get("user_has_caption"),
+        )
+
+    # --------------------------------------------------
+    # 2) В МОД-ЧАТЕ ОБНОВЛЯЕМ СООБЩЕНИЕ СТАТУСОМ (служебно, как и было)
+    # --------------------------------------------------
+    moderator_u = callback.from_user.username
+    moderator_text = f"@{moderator_u}" if moderator_u else f"id{callback.from_user.id}"
+
+    status_mod = (
+        "✅ Опубликовано!\n"
+        f"Модератор: {moderator_text}\n"
+        f"Ссылка: {url}"
+    )
+
+    new_text = _append_once(_get_msg_text_or_caption(callback), status_mod)
+
+    await _safe_edit(
+        callback,
+        new_text,
+        reply_markup=None,
+        parse_mode=ParseMode.HTML,
+        disable_preview=True,
+        allow_fallback=False,  # мод-чат — никаких новых сообщений
+    )
+
+    pending.pop(ad_id, None)
+
+
+# ------------------------------------------------------
+# MODERATION: REJECT (меняем только клавиатуру причин)
+# ------------------------------------------------------
+
 
 @router.callback_query(F.data.startswith("mod_reject"))
 async def mod_reject_callback(callback: CallbackQuery, state: FSMContext):
-    # импортируем ядро, чтобы не ловить циклические импорты
-    from findex_bot import bot as core
+    await _safe_answer(callback)
 
-    ad_id = callback.data.split(":")[1]
-    ad_data = core.ADS_PENDING.get(ad_id)
-
-    if not ad_data:
-        await callback.answer("Объявление не найдено!", show_alert=True)
-        return
-
-    # если по объявлению уже было принято решение — не даём повторно тыкать
-    if ad_id in core.PROCESSED_ADS:
-        await callback.answer("Это объявление уже обработано ранее.", show_alert=True)
-        return
-
-    # убираем старую клавиатуру у сообщения с модерацией
-    await callback.message.edit_reply_markup(reply_markup=None)
-
-    media_id = ad_data.get("media_id")
-    media_type = ad_data.get("media_type")
-    base_text = get_ad_text(ad_data, include_author=True) + "\n\nВыберите причину отклонения:"
-
-    if media_id and media_type == "photo":
-        await callback.bot.send_photo(
-            chat_id=core.config.moderation_chat_id,
-            photo=media_id,
-            caption=base_text,
-            reply_markup=rejection_keyboard(ad_id),
-        )
-    elif media_id and media_type == "video":
-        await callback.bot.send_video(
-            chat_id=core.config.moderation_chat_id,
-            video=media_id,
-            caption=base_text,
-            reply_markup=rejection_keyboard(ad_id),
-        )
-    else:
-        await callback.bot.send_message(
-            chat_id=core.config.moderation_chat_id,
-            text=base_text,
-            reply_markup=rejection_keyboard(ad_id),
-        )
-
-    await callback.answer()
-
-
-# ------ ОБРАБОТКА ВЫБОРА ПРИЧИНЫ ОТКЛОНЕНИЯ ------
-
-@router.callback_query(F.data.startswith("mod_reason"))
-async def mod_reason_callback(callback: CallbackQuery, state: FSMContext):
-    """
-    Формат данных:
-    mod_reason:<ad_id>:<reason_type>
-    """
-    from findex_bot import bot as core
-
-    _, ad_id, reason_type = callback.data.split(":")
-
-    # защита от повторных решений
-    if ad_id in core.PROCESSED_ADS:
-        await callback.answer("По этому объявлению решение уже принято ранее.", show_alert=True)
-        return
-
-    ad_data = core.ADS_PENDING.get(ad_id)
-    if not ad_data:
-        await callback.answer("Объявление не найдено!", show_alert=True)
-        return
-
-    author_id = ad_data.get("author_id")
-
-    # --- Шаблонные причины из словаря REJECTION_REASON_TEXTS ---
-    if reason_type in core.REJECTION_REASON_TEXTS:
-        reason_text = core.REJECTION_REASON_TEXTS[reason_type]
-
-        # кнопка пользователю — сразу к нужному полю на редактирование
-        edit_kb = InlineKeyboardMarkup(
-            inline_keyboard=[
-                [
-                    InlineKeyboardButton(
-                        text=f"Редактировать {reason_text.split()[0].lower()}",
-                        callback_data=f"edit_after_reject:{ad_id}:{reason_type}",
-                    )
-                ]
-            ]
-        )
-
-        if author_id:
-            await callback.bot.send_message(
-                chat_id=author_id,
-                text=f"❌ Ваша заявка отклонена модератором.\nПричина: {reason_text}",
-                reply_markup=edit_kb,
-            )
-
-        extra_text = f"✖ Отклонено: причина — {reason_text}"
-        await send_ad_preview(
-            core.config.moderation_chat_id,
-            ad_data,
-            callback.bot,
-            extra_text=extra_text,
-        )
-
-        # помечаем объявление как окончательно обработанное
-        core.PROCESSED_ADS.add(ad_id)
-
-        await callback.answer("Отклонено — причина отправлена пользователю.", show_alert=True)
-
-    # --- Кастомная причина: "Другая причина" ---
-    elif reason_type == "custom":
-        await state.set_state(ModRejectionForm.awaiting_reason)
-        await state.update_data(ad_id=ad_id)
-
-        await callback.message.answer(
-            "Напишите вашу причину отклонения и отправьте её отдельным сообщением.",
-            reply_markup=ReplyKeyboardRemove(),
-        )
-        await callback.answer()
-
-
-# ------ КАСТОМНАЯ ПРИЧИНА ОТКЛОНЕНИЯ (текстом) ------
-
-@router.message(ModRejectionForm.awaiting_reason)
-async def mod_custom_reason(message: Message, state: FSMContext):
-    from findex_bot import bot as core
-
-    state_data = await state.get_data()
-    ad_id = state_data.get("ad_id")
-
+    ad_id = _parse_ad_id(callback.data or "")
     if not ad_id:
-        await message.answer("Ошибка: не найдено объявление для отклонения.")
-        await state.clear()
         return
 
-    # защита от повторного решения
-    if ad_id in core.PROCESSED_ADS:
-        await message.answer("По этому объявлению решение уже принято ранее.")
-        await state.clear()
-        return
+    await state.clear()
+    await state.update_data(mod_reject_ad_id=ad_id)
 
-    ad_data = core.ADS_PENDING.get(ad_id)
-    author_id = ad_data.get("author_id") if ad_data else None
+    try:
+        await callback.message.edit_reply_markup(reply_markup=rejection_keyboard(ad_id))
+    except Exception:
+        original = _get_msg_text_or_caption(callback)
+        await _safe_edit(
+            callback,
+            original,
+            reply_markup=rejection_keyboard(ad_id),
+            parse_mode=ParseMode.HTML,
+            disable_preview=True,
+            allow_fallback=False,  # мод-чат
+        )
 
-    custom_reason = (message.text or "").strip()
-    if not ad_data or not custom_reason:
-        await message.answer("Ошибка. Не найдено объявление или причина пуста.")
-        await state.clear()
-        return
 
-    edit_kb = InlineKeyboardMarkup(
+# ------------------------------------------------------
+# MODERATION: REASON → отклоняем и возвращаем автору на правку
+# ------------------------------------------------------
+
+
+def _reason_text(field: str) -> str:
+    m = {
+        "position": "Должность некорректная",
+        "schedule": "График некорректный",
+        "salary": "Зарплата некорректная",
+        "location": "Локация некорректная",
+        "contacts": "Контакты некорректные",
+        "description": "Описание неправильное",
+        "custom": "Другая причина",
+    }
+    return m.get(field, "Другая причина")
+
+
+def _make_fix_keyboard(ad_id: str, field: str) -> InlineKeyboardMarkup:
+    titles = {
+        "position": "Должность",
+        "schedule": "График",
+        "salary": "Зарплата",
+        "location": "Локация",
+        "contacts": "Контакты",
+        "description": "Описание",
+        "custom": "Другое",
+    }
+    return InlineKeyboardMarkup(
         inline_keyboard=[
             [
                 InlineKeyboardButton(
-                    text="Редактировать объявление",
-                    callback_data=f"edit_after_reject:{ad_id}:all",
+                    text=f"✏️ Исправить: {titles.get(field, 'Поле')}",
+                    callback_data=f"fix_rej:{ad_id}:{field}",
                 )
             ]
         ]
     )
 
-    if author_id:
-        await message.bot.send_message(
-            chat_id=author_id,
-            text=f"❌ Ваша заявка отклонена модератором.\nПричина: {custom_reason}",
-            reply_markup=edit_kb,
-        )
 
-    extra_text = f"✖ Отклонено: причина — {custom_reason}"
-    await send_ad_preview(
-        core.config.moderation_chat_id,
-        ad_data,
-        message.bot,
-        extra_text=extra_text,
+@router.callback_query(F.data.startswith("mod_reason:"))
+async def mod_reason_callback(callback: CallbackQuery, state: FSMContext):
+    await _safe_answer(callback)
+
+    ad_id, field = _parse_mod_reason(callback.data or "")
+    if not ad_id:
+        st = await state.get_data()
+        ad_id = st.get("mod_reject_ad_id")
+
+    if not ad_id:
+        return
+
+    field = (field or "custom").lower().strip()
+    reason = _reason_text(field)
+
+    pending = _get_pending_storage()
+    ad = pending.get(ad_id)
+    if not ad:
+        await state.clear()
+        return
+
+    author_id = ad.get("author_id")
+
+    _get_rejected_storage()[ad_id] = ad
+    pending.pop(ad_id, None)
+
+    if author_id:
+        try:
+            await callback.bot.send_message(
+                chat_id=int(author_id),
+                text=(
+                    "❌ Объявление отклонено модератором.\n\n"
+                    f"Причина: <b>{reason}</b>\n\n"
+                    "Нажми кнопку ниже, чтобы сразу исправить."
+                ),
+                parse_mode=ParseMode.HTML,
+                reply_markup=_make_fix_keyboard(ad_id, field),
+            )
+        except Exception:
+            pass
+
+    status = f"✖ Отклонено: причина — {reason}"
+    base = _get_msg_text_or_caption(callback)
+    new_text = _append_once(base, status)
+
+    await _safe_edit(
+        callback,
+        new_text,
+        reply_markup=None,
+        parse_mode=ParseMode.HTML,
+        disable_preview=True,
+        allow_fallback=False,
     )
 
-    core.PROCESSED_ADS.add(ad_id)
-
-    await message.answer("Причина отклонения отправлена!", reply_markup=ReplyKeyboardRemove())
     await state.clear()
 
 
-# ------ МГНОВЕННОЕ РЕДАКТИРОВАНИЕ ПОСЛЕ ОТКЛОНЕНИЯ ------
+# ------------------------------------------------------
+# AUTHOR: FIX AFTER REJECTION → снимаем блокировку + force_preview
+# ------------------------------------------------------
 
-@router.callback_query(F.data.startswith("edit_after_reject"))
-async def edit_after_reject(callback: CallbackQuery, state: FSMContext):
-    from findex_bot import bot as core
 
-    _, ad_id, reason_type = callback.data.split(":")
-    ad_data = core.ADS_PENDING.get(ad_id)
+@router.callback_query(F.data.startswith("fix_rej:"))
+async def fix_rejected_ad(callback: CallbackQuery, state: FSMContext):
+    await _safe_answer(callback)
+
+    parts = (callback.data or "").split(":")
+    if len(parts) < 3:
+        return
+
+    ad_id = parts[1].strip()
+    field = parts[2].strip().lower()
+
+    rejected = _get_rejected_storage()
+    ad_data = rejected.get(ad_id)
     if not ad_data:
-        await callback.answer("Объявление не найдено!", show_alert=True)
+        await _safe_answer(callback, "Объявление не найдено", show_alert=True)
         return
 
     role = ad_data.get("role", "Работодатель")
 
+    # ✅ Грузим данные, снимаем блокировку и включаем принудительный предпросмотр
     await state.clear()
     await state.update_data(**ad_data)
+    await state.update_data(on_moderation=False, is_inline_edit=True, force_preview=True)
 
-    # ---- СОИСКАТЕЛЬ ----
     if role == "Соискатель":
-        if reason_type == "position":
-            await state.update_data(is_inline_edit=True)
-            await state.set_state(SeekerForm.position)
-            await callback.bot.send_message(
-                chat_id=callback.from_user.id,
-                text="Измени 👤 должность.\n<i>Пример: Бариста, Официант, Администратор</i>",
-                parse_mode=ParseMode.HTML,
-                reply_markup=ReplyKeyboardRemove(),
-            )
-        elif reason_type == "schedule":
-            await state.update_data(is_inline_edit=True)
-            await state.set_state(SeekerForm.schedule)
-            await callback.bot.send_message(
-                chat_id=callback.from_user.id,
-                text="Измени 🕒 график.\n<i>Пример: 5/2, 2/2, Сменный, Гибкий, Удалёнка</i>",
-                parse_mode=ParseMode.HTML,
-                reply_markup=ReplyKeyboardRemove(),
-            )
-        elif reason_type == "salary":
-            await state.update_data(is_inline_edit=True)
-            await state.set_state(SeekerForm.salary)
-            await callback.bot.send_message(
-                chat_id=callback.from_user.id,
-                text="Измени 💲 зарплату (ожидания).\n<i>Пример: от 80 000, 120 000, по договорённости</i>",
-                parse_mode=ParseMode.HTML,
-                reply_markup=ReplyKeyboardRemove(),
-            )
-        elif reason_type == "location":
-            await state.update_data(is_inline_edit=True)
-            await state.set_state(SeekerForm.location)
-            await callback.bot.send_message(
-                chat_id=callback.from_user.id,
-                text="Измени 📍 локацию.\n<i>Пример: Москва, Санкт-Петербург, Дистанционно</i>",
-                parse_mode=ParseMode.HTML,
-                reply_markup=ReplyKeyboardRemove(),
-            )
-        elif reason_type == "contacts":
-            await state.update_data(is_inline_edit=True)
-            await state.set_state(SeekerForm.contacts)
-            await callback.bot.send_message(
-                chat_id=callback.from_user.id,
-                text="Измени ☎️ контакты.\n<i>Пример: @username, email@example.com, +7 777 1234567</i>",
-                parse_mode=ParseMode.HTML,
-                reply_markup=ReplyKeyboardRemove(),
-            )
-        elif reason_type == "description":
-            await state.update_data(is_inline_edit=True)
-            await state.set_state(SeekerForm.description)
-            await callback.bot.send_message(
-                chat_id=callback.from_user.id,
-                text="Измени 📝 блок «О себе» (до 2000 символов).\n<i>Опыт, навыки, что ищешь и т.д.</i>",
-                parse_mode=ParseMode.HTML,
-                reply_markup=ReplyKeyboardRemove(),
-            )
-        else:  # all / кастом
-            await state.set_state(SeekerForm.preview)
-            await send_preview(callback.from_user.id, state, callback.bot)
-
-    # ---- РАБОТОДАТЕЛЬ ----
+        mapping = {
+            "position": SeekerForm.position,
+            "schedule": SeekerForm.schedule,
+            "salary": SeekerForm.salary,
+            "location": SeekerForm.location,
+            "contacts": SeekerForm.contacts,
+            "description": SeekerForm.description,
+        }
     else:
-        if reason_type == "position":
-            await state.update_data(is_inline_edit=True)
-            await state.set_state(EmployerForm.position)
-            await callback.bot.send_message(
-                chat_id=callback.from_user.id,
-                text="Измени 👤 должность.\n<i>Пример: Бармен, Официант, Администратор</i>",
-                parse_mode=ParseMode.HTML,
-                reply_markup=ReplyKeyboardRemove(),
-            )
-        elif reason_type == "salary":
-            await state.update_data(is_inline_edit=True)
-            await state.set_state(EmployerForm.salary)
-            await callback.bot.send_message(
-                chat_id=callback.from_user.id,
-                text="Измени 💲 зарплату.\n<i>Пример: 120000, до 200000, от 80k, по договорённости</i>",
-                parse_mode=ParseMode.HTML,
-                reply_markup=ReplyKeyboardRemove(),
-            )
-        elif reason_type == "location":
-            await state.update_data(is_inline_edit=True)
-            await state.set_state(EmployerForm.location)
-            await callback.bot.send_message(
-                chat_id=callback.from_user.id,
-                text="Измени 📍 локацию.\n<i>Пример: Москва, Санкт-Петербург, Дистанционно</i>",
-                parse_mode=ParseMode.HTML,
-                reply_markup=ReplyKeyboardRemove(),
-            )
-        elif reason_type == "contacts":
-            await state.update_data(is_inline_edit=True)
-            await state.set_state(EmployerForm.contacts)
-            await callback.bot.send_message(
-                chat_id=callback.from_user.id,
-                text="Измени ☎️ контакты.\n<i>Пример: @username, email@example.com, +7 777 1234567</i>",
-                parse_mode=ParseMode.HTML,
-                reply_markup=ReplyKeyboardRemove(),
-            )
-        elif reason_type == "description":
-            await state.update_data(is_inline_edit=True)
-            await state.set_state(EmployerForm.description)
-            await callback.bot.send_message(
-                chat_id=callback.from_user.id,
-                text="Измени 📝 описание (до 2000 символов).\n<i>Требования, задачи, что предлагаем и т.д.</i>",
-                parse_mode=ParseMode.HTML,
-                reply_markup=ReplyKeyboardRemove(),
-            )
-        else:  # all / кастом
-            await state.set_state(EmployerForm.preview)
-            await send_preview(callback.from_user.id, state, callback.bot)
+        mapping = {
+            "position": EmployerForm.position,
+            "salary": EmployerForm.salary,
+            "location": EmployerForm.location,
+            "contacts": EmployerForm.contacts,
+            "description": EmployerForm.description,
+        }
 
-    await callback.answer()
-
-# ------ УНИВЕРСАЛЬНАЯ ДОЗАПИСЬ ПОЛЕЙ ПОСЛЕ ОТКЛОНЕНИЯ (СОИСКАТЕЛЬ) ------
-
-@router.message(SeekerForm.position)
-@router.message(SeekerForm.schedule)
-@router.message(SeekerForm.salary)
-@router.message(SeekerForm.location)
-@router.message(SeekerForm.contacts)
-@router.message(SeekerForm.description)
-async def edit_field_after_reject_seeker(message: Message, state: FSMContext):
-    current_state = await state.get_state()
-    field = None
-    next_state = None
-
-    if current_state == SeekerForm.position.state:
-        field, next_state = "position", SeekerForm.preview
-    elif current_state == SeekerForm.schedule.state:
-        field, next_state = "schedule", SeekerForm.preview
-    elif current_state == SeekerForm.salary.state:
-        field, next_state = "salary", SeekerForm.preview
-    elif current_state == SeekerForm.location.state:
-        field, next_state = "location", SeekerForm.preview
-    elif current_state == SeekerForm.contacts.state:
-        field, next_state = "contacts", SeekerForm.preview
-    elif current_state == SeekerForm.description.state:
-        field, next_state = "description", SeekerForm.preview
-    else:
+    target_state = mapping.get(field)
+    if not target_state:
+        await _safe_answer(callback, "Поле не поддерживается", show_alert=True)
         return
 
-    await state.update_data(**{field: (message.text or "").strip()})
-    data = await state.get_data()
+    await state.set_state(target_state)
 
-    if data.get("is_inline_edit"):
-        await state.update_data(is_inline_edit=False)
-        await state.set_state(next_state)
-        await send_preview(message, state, message.bot)
+    prompts = {
+        "position": "Введи исправленную 👤 должность:",
+        "schedule": "Введи исправленный 🕒 график:",
+        "salary": "Введи исправленную 💲 зарплату:",
+        "location": "Введи исправленную 📍 локацию:",
+        "contacts": "Введи исправленные ☎️ контакты:",
+        "description": "Введи исправленное 📝 описание:",
+        "custom": "Введи исправления:",
+    }
 
-
-# ------ ОДОБРЕНИЕ (ПУБЛИКАЦИЯ) ОБЪЯВЛЕНИЯ ------
-
-@router.callback_query(F.data.startswith("mod_approve"))
-async def mod_approve_callback(callback: CallbackQuery):
-    from findex_bot import bot as core
-
-    ad_id = callback.data.split(":")[1]
-    ad_data = core.ADS_PENDING.get(ad_id)
-    if not ad_data:
-        await callback.answer("Объявление не найдено!", show_alert=True)
-        return
-
-    # защита от повторного нажатия "Опубликовать"
-    if ad_id in core.PROCESSED_ADS:
-        await callback.answer("Это объявление уже обработано!", show_alert=True)
-        return
-
-    main_channel_id = core.config.main_channel_id
-    channel_username = core.config.channel_username.lstrip("@")
-    text_public = get_ad_text(ad_data, include_author=False)
-    author_id = ad_data.get("author_id")
-    moderator = callback.from_user.username
-    moderator_text = f"@{moderator}" if moderator else f"id{callback.from_user.id}"
-
-    # Публикация в основной канал
-    if ad_data.get("media_type") == "photo":
-        sent_msg = await callback.bot.send_photo(
-            main_channel_id,
-            photo=ad_data["media_id"],
-            caption=text_public,
-        )
-    elif ad_data.get("media_type") == "video":
-        sent_msg = await callback.bot.send_video(
-            main_channel_id,
-            video=ad_data["media_id"],
-            caption=text_public,
-        )
-    else:
-        sent_msg = await callback.bot.send_message(
-            main_channel_id,
-            text_public,
-        )
-
-    post_url = f"https://t.me/{channel_username}/{sent_msg.message_id}"
-
-    # Запись в модераторский чат
-    mod_text = f"✅ Опубликовано!\nМодератор: {moderator_text}\nСсылка: {post_url}"
-    await send_ad_preview(
-        core.config.moderation_chat_id,
-        ad_data,
-        callback.bot,
-        extra_text=mod_text,
-    )
-
-    # помечаем объявление как окончательно обработанное
-    core.PROCESSED_ADS.add(ad_id)
-
-    # Уведомление автору + обновление счётчика бесплатных публикаций
-    if author_id:
-        core.increment_pub_counter(author_id)
-        _, remaining = core.check_and_update_limit(author_id)
-
-        await callback.bot.send_message(
-            chat_id=author_id,
-            text=(
-                f"✅ Ваше объявление опубликовано!\n"
-                f"Ссылка на объявление: {post_url}\n\n"
-                f"Осталось бесплатных публикаций сегодня: {remaining}/3\n\n"
-                f"Чтобы добавить следующее объявление — просто нажми /start"
-            ),
-        )
-
-    # убираем кнопки "Одобрить / Отклонить" у модератора
-    await callback.message.edit_reply_markup(reply_markup=None)
-    await callback.answer("Объявление опубликовано!")
-
+    try:
+        await callback.message.answer(prompts.get(field, "Введи исправленное значение:"))
+    except Exception:
+        try:
+            await callback.bot.send_message(
+                chat_id=callback.from_user.id,
+                text=prompts.get(field, "Введи исправленное значение:"),
+            )
+        except Exception:
+            pass
