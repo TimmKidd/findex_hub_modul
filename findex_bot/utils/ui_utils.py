@@ -1,282 +1,236 @@
-from aiogram.types import (
-    Message,
-    InlineKeyboardMarkup,
-    InlineKeyboardButton,
-)
-from aiogram.enums import ParseMode
-from aiogram.fsm.context import FSMContext
+# findex_bot/utils/ui_utils.py
+from __future__ import annotations
 
-from findex_bot.utils.vacancy_utils import (
-    contains_bad_words,
-    is_valid_city_input,
-    get_ad_text,
-)
+from datetime import datetime, timezone, timedelta
+from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery, Message
 
 
-def get_full_edit_keyboard(role: str) -> InlineKeyboardMarkup:
+# ✅ единый noop для заглушек
+NOOP_CALLBACK = "noop"
+
+# ✅ лимит
+DAILY_FREE_LIMIT = 3
+
+# ✅ безлимитные юзеры (username без @, в lower)
+UNLIMITED_USERNAMES = {"findexhub_manager", "timmkidd"}
+
+
+def is_unlimited_user(username: str | None) -> bool:
+    if not username:
+        return False
+    return username.strip().lstrip("@").lower() in UNLIMITED_USERNAMES
+
+
+def utc_day_key(dt: datetime | None = None) -> str:
+    dt = dt or datetime.now(timezone.utc)
+    return dt.strftime("%Y-%m-%d")
+
+
+def utc_seconds_to_reset(now: datetime | None = None) -> int:
+    now = now or datetime.now(timezone.utc)
+    # следующий 00:00 UTC
+    tomorrow_utc_midnight = (now.replace(hour=0, minute=0, second=0, microsecond=0) + timedelta(days=1))
+    sec = int((tomorrow_utc_midnight - now).total_seconds())
+    return max(0, sec)
+
+
+def format_hhmmss(seconds: int) -> str:
+    seconds = max(0, int(seconds))
+    h = seconds // 3600
+    m = (seconds % 3600) // 60
+    s = seconds % 60
+    return f"{h:02d}:{m:02d}:{s:02d}"
+
+
+async def safe_answer(cb: CallbackQuery, text: str | None = None, alert: bool = False):
+    try:
+        if text is None:
+            await cb.answer()
+        else:
+            await cb.answer(text, show_alert=alert)
+    except Exception:
+        pass
+
+
+async def send_saved_hint(message_or_cb: Message | CallbackQuery):
     """
-    Инлайн-клавиатура для предпросмотра объявления.
-    Разные кнопки для Работодателя и Соискателя.
+    ✅ Изменения сохранены (как у тебя на скрине)
     """
-    if role == "Соискатель":
-        keyboard = [
-            [
-                InlineKeyboardButton(
-                    text="👤 Должность",
-                    callback_data="seek_edit_position",
-                ),
-                InlineKeyboardButton(
-                    text="🕒 График",
-                    callback_data="seek_edit_schedule",
-                ),
-            ],
-            [
-                InlineKeyboardButton(
-                    text="💲 Зарплата",
-                    callback_data="seek_edit_salary",
-                ),
-                InlineKeyboardButton(
-                    text="📍 Локация",
-                    callback_data="seek_edit_location",
-                ),
-            ],
-            [
-                InlineKeyboardButton(
-                    text="☎️ Контакты",
-                    callback_data="seek_edit_contacts",
-                ),
-                InlineKeyboardButton(
-                    text="📝 Описание",
-                    callback_data="seek_edit_description",
-                ),
-            ],
-            [
-                InlineKeyboardButton(
-                    text="✅ Отправить на модерацию",
-                    callback_data="seek_send_mod",
-                )
-            ],
-        ]
-    else:  # Работодатель
-        keyboard = [
-            [
-                InlineKeyboardButton(
-                    text="👤 Должность",
-                    callback_data="emp_edit_position",
-                ),
-                InlineKeyboardButton(
-                    text="💲 Зарплата",
-                    callback_data="emp_edit_salary",
-                ),
-            ],
-            [
-                InlineKeyboardButton(
-                    text="📍 Локация",
-                    callback_data="emp_edit_location",
-                ),
-                InlineKeyboardButton(
-                    text="☎️ Контакты",
-                    callback_data="emp_edit_contacts",
-                ),
-            ],
-            [
-                InlineKeyboardButton(
-                    text="📝 Описание",
-                    callback_data="emp_edit_description",
-                ),
-            ],
-            [
-                InlineKeyboardButton(
-                    text="✅ Отправить на модерацию",
-                    callback_data="emp_send_mod",
-                )
-            ],
-        ]
-
-    return InlineKeyboardMarkup(inline_keyboard=keyboard)
+    try:
+        if isinstance(message_or_cb, Message):
+            await message_or_cb.answer("✅ Изменения сохранены")
+        else:
+            if message_or_cb.message:
+                await message_or_cb.message.answer("✅ Изменения сохранены")
+            else:
+                await message_or_cb.bot.send_message(message_or_cb.from_user.id, "✅ Изменения сохранены")
+    except Exception:
+        pass
 
 
-def moderation_keyboard(ad_id: str) -> InlineKeyboardMarkup:
+def sent_to_moderation_stub_kb() -> InlineKeyboardMarkup:
     """
-    Клавиатура под объявлением в модераторском чате:
-    [Одобрить] [Отклонить]
+    ✅ Заглушка как на скрине: одна кнопка под предпросмотром, не отдельным сообщением.
     """
     return InlineKeyboardMarkup(
         inline_keyboard=[
+            [InlineKeyboardButton(text="⏳ Объявление отправлено на модерацию", callback_data=NOOP_CALLBACK)]
+        ]
+    )
+
+
+# -----------------------------
+# Поля: человеко-читаемые названия
+# -----------------------------
+def field_title(field_key: str) -> str:
+    key = (field_key or "").strip().lower()
+    mapping = {
+        "title": "Должность",
+        "schedule": "График",
+        "salary": "Зарплата",
+        "location": "Локация",
+        "contacts": "Контакты",
+        "description": "Описание",
+        "about": "О себе",
+        "media": "Медиа",
+        "photo": "Фото",
+        "video": "Видео",
+    }
+    return mapping.get(key, "Поле")
+
+
+def rejected_user_text(reason: str) -> str:
+    return (
+        "❌ Объявление отклонено модератором.\n\n"
+        f"Причина: <b>{reason}</b>\n\n"
+        "Нажми кнопку ниже, чтобы сразу исправить."
+    )
+
+
+# -----------------------------
+# Медиа: выбор и подтверждение
+# -----------------------------
+def employer_media_choice_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="➕ Добавить медиа", callback_data="emp_media_add")],
+            [InlineKeyboardButton(text="⏭ Без медиа", callback_data="emp_media_skip")],
+        ]
+    )
+
+
+def seeker_media_choice_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="➕ Добавить фото", callback_data="seek_media_add")],
+            [InlineKeyboardButton(text="⏭ Без фото", callback_data="seek_media_skip")],
+        ]
+    )
+
+
+def media_confirm_kb(prefix: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
             [
-                InlineKeyboardButton(
-                    text="✅ Одобрить",
-                    callback_data=f"mod_approve:{ad_id}",
-                ),
-                InlineKeyboardButton(
-                    text="❌ Отклонить",
-                    callback_data=f"mod_reject:{ad_id}",
-                ),
+                InlineKeyboardButton(text="✅ Подтвердить", callback_data=f"{prefix}:ok"),
+                InlineKeyboardButton(text="🔁 Заменить", callback_data=f"{prefix}:retry"),
+                InlineKeyboardButton(text="🗑 Удалить", callback_data=f"{prefix}:delete"),
             ]
         ]
     )
 
 
-def rejection_keyboard(ad_id: str) -> InlineKeyboardMarkup:
-    """
-    Клавиатура выбора причины отклонения.
-    """
+# -----------------------------
+# Предпросмотр
+# -----------------------------
+def employer_preview_keyboard(ad_id: int) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [
-                InlineKeyboardButton(
-                    text="Должность некорректная",
-                    callback_data=f"mod_reason:{ad_id}:position",
-                )
+                InlineKeyboardButton(text="👤 Должность", callback_data=f"emp_edit_title:{ad_id}"),
+                InlineKeyboardButton(text="💲 Зарплата", callback_data=f"emp_edit_salary:{ad_id}"),
             ],
             [
-                InlineKeyboardButton(
-                    text="Зарплата некорректная",
-                    callback_data=f"mod_reason:{ad_id}:salary",
-                )
+                InlineKeyboardButton(text="📍 Локация", callback_data=f"emp_edit_location:{ad_id}"),
+                InlineKeyboardButton(text="📞 Контакты", callback_data=f"emp_edit_contacts:{ad_id}"),
             ],
             [
-                InlineKeyboardButton(
-                    text="Локация некорректная",
-                    callback_data=f"mod_reason:{ad_id}:location",
-                )
+                InlineKeyboardButton(text="📝 Описание", callback_data=f"emp_edit_description:{ad_id}"),
             ],
             [
-                InlineKeyboardButton(
-                    text="Контакты некорректные",
-                    callback_data=f"mod_reason:{ad_id}:contacts",
-                )
+                InlineKeyboardButton(text="🎞 Медиа", callback_data=f"emp_edit_media:{ad_id}"),
             ],
             [
-                InlineKeyboardButton(
-                    text="Описание некорректное",
-                    callback_data=f"mod_reason:{ad_id}:description",
-                )
-            ],
-            [
-                InlineKeyboardButton(
-                    text="Другая причина",
-                    callback_data=f"mod_reason:{ad_id}:custom",
-                )
+                InlineKeyboardButton(text="✅ Отправить на модерацию", callback_data=f"send_employer:{ad_id}"),
             ],
         ]
     )
 
 
-async def send_ad_preview(
-    chat_id: int,
-    ad_data: dict,
-    bot,
-    extra_text: str | None = None,
-):
-    """
-    Универсальная отправка объявления в мод-чат:
-    - если есть фото/видео — отправляем медиа с caption
-    - если медиа нет — обычный текст
-    """
-    text = get_ad_text(ad_data, include_author=True)
-    if extra_text:
-        text = f"{text}\n\n{extra_text}"
-
-    media_id = ad_data.get("media_id")
-    media_type = ad_data.get("media_type")
-
-    if media_id and media_type == "photo":
-        await bot.send_photo(
-            chat_id=chat_id,
-            photo=media_id,
-            caption=text,
-            parse_mode=ParseMode.HTML,
-        )
-    elif media_id and media_type == "video":
-        await bot.send_video(
-            chat_id=chat_id,
-            video=media_id,
-            caption=text,
-            parse_mode=ParseMode.HTML,
-        )
-    else:
-        await bot.send_message(
-            chat_id=chat_id,
-            text=text,
-            parse_mode=ParseMode.HTML,
-        )
+def seeker_preview_keyboard(ad_id: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(text="👤 Должность", callback_data=f"seek_edit_title:{ad_id}"),
+                InlineKeyboardButton(text="🕒 График", callback_data=f"seek_edit_schedule:{ad_id}"),
+            ],
+            [
+                InlineKeyboardButton(text="💲 Зарплата", callback_data=f"seek_edit_salary:{ad_id}"),
+                InlineKeyboardButton(text="📍 Локация", callback_data=f"seek_edit_location:{ad_id}"),
+            ],
+            [
+                InlineKeyboardButton(text="📞 Контакты", callback_data=f"seek_edit_contacts:{ad_id}"),
+                InlineKeyboardButton(text="📝 О себе", callback_data=f"seek_edit_about:{ad_id}"),
+            ],
+            [
+                InlineKeyboardButton(text="🖼 Фото", callback_data=f"seek_edit_media:{ad_id}"),
+            ],
+            [
+                InlineKeyboardButton(text="✅ Отправить на модерацию", callback_data=f"send_seeker:{ad_id}"),
+            ],
+        ]
+    )
 
 
-async def send_preview(
-    message_or_chat: Message | int,
-    state: FSMContext,
-    bot,
-):
-    """
-    Предпросмотр объявления пользователю (ОДНО сообщение):
-    - если есть медиа — фото/видео + caption = текст объявления
-    - если нет — просто текст + инлайн-клавиатура
-    """
-    data = await state.get_data()
-    role = data.get("role", "Работодатель")
+def get_full_edit_keyboard(role: str, ad_id: int) -> InlineKeyboardMarkup:
+    r = (role or "").strip().lower()
+    return seeker_preview_keyboard(ad_id) if r == "seeker" else employer_preview_keyboard(ad_id)
 
-    text = get_ad_text(data, include_author=False)
-    keyboard = get_full_edit_keyboard(role)
 
-    # message_or_chat может быть Message или просто chat_id
-    if isinstance(message_or_chat, Message):
-        chat_id = message_or_chat.chat.id
-    else:
-        chat_id = int(message_or_chat)
+def moderation_keyboard(ad_id: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(text="✅ Одобрить", callback_data=f"approve:{ad_id}"),
+                InlineKeyboardButton(text="❌ Отклонить", callback_data=f"reject:{ad_id}"),
+            ]
+        ]
+    )
 
-    media_id = data.get("media_id")
-    media_type = data.get("media_type")
 
-    if media_id and media_type == "photo":
-        await bot.send_photo(
-            chat_id=chat_id,
-            photo=media_id,
-            caption=text,
-            reply_markup=keyboard,
-            parse_mode=ParseMode.HTML,
-        )
-    elif media_id and media_type == "video":
-        await bot.send_video(
-            chat_id=chat_id,
-            video=media_id,
-            caption=text,
-            reply_markup=keyboard,
-            parse_mode=ParseMode.HTML,
-        )
-    else:
-        await bot.send_message(
-            chat_id=chat_id,
-            text=text,
-            reply_markup=keyboard,
-            parse_mode=ParseMode.HTML,
+def rejection_reasons_kb(ad_id: int, role: str) -> InlineKeyboardMarkup:
+    role = (role or "").strip().lower()
+
+    if role == "seeker":
+        return InlineKeyboardMarkup(
+            inline_keyboard=[
+                [InlineKeyboardButton(text="👤 Должность некорректная", callback_data=f"rejr:{ad_id}:title")],
+                [InlineKeyboardButton(text="🕒 График некорректный", callback_data=f"rejr:{ad_id}:schedule")],
+                [InlineKeyboardButton(text="💲 Зарплата некорректная", callback_data=f"rejr:{ad_id}:salary")],
+                [InlineKeyboardButton(text="📍 Локация некорректная", callback_data=f"rejr:{ad_id}:location")],
+                [InlineKeyboardButton(text="📞 Контакты некорректные", callback_data=f"rejr:{ad_id}:contacts")],
+                [InlineKeyboardButton(text="📝 О себе заполнено некорректно", callback_data=f"rejr:{ad_id}:about")],
+                [InlineKeyboardButton(text="🖼 Фото некорректное", callback_data=f"rejr:{ad_id}:media")],
+            ]
         )
 
-
-_FIELD_TITLES = {
-    "position": "должность",
-    "schedule": "график",
-    "salary": "зарплату",
-    "location": "локацию",
-    "contacts": "контакты",
-    "description": "описание",
-}
-
-
-async def filter_field_mat(message: Message, field: str) -> bool:
-    """
-    Асинхронный фильтр мата для полей вакансии/резюме.
-    Если находит мат — шлёт предупреждение и возвращает False.
-    """
-    text = (message.text or "").lower()
-
-    if contains_bad_words(text):
-        field_title = _FIELD_TITLES.get(field, "это поле")
-        await message.answer(
-            f"Без мата, пожалуйста 🙂\n"
-            f"Переформулируй {field_title} без нецензурной лексики."
-        )
-        return False
-
-    return True
-
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="👤 Должность некорректная", callback_data=f"rejr:{ad_id}:title")],
+            [InlineKeyboardButton(text="💲 Зарплата некорректная", callback_data=f"rejr:{ad_id}:salary")],
+            [InlineKeyboardButton(text="📍 Локация некорректная", callback_data=f"rejr:{ad_id}:location")],
+            [InlineKeyboardButton(text="📞 Контакты некорректные", callback_data=f"rejr:{ad_id}:contacts")],
+            [InlineKeyboardButton(text="📝 Описание некорректное", callback_data=f"rejr:{ad_id}:description")],
+            [InlineKeyboardButton(text="🎞 Медиа некорректное", callback_data=f"rejr:{ad_id}:media")],
+        ]
+    )

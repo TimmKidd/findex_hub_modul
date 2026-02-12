@@ -1,26 +1,33 @@
+# findex_bot/states/vacancies.py
+from __future__ import annotations
+
 from aiogram.fsm.state import StatesGroup, State
 
+
 class EmployerForm(StatesGroup):
-    position = State()
-    salary = State()  
+    title = State()
+    salary = State()
     location = State()
-    contacts = State()   
-    description = State() 
-    media_choice = State() 
-    waiting_media = State()
+    contacts = State()
+    description = State()
+
+    media_choice = State()
+    media_wait = State()
+    media_confirm = State()
+
     preview = State()
 
+
 class SeekerForm(StatesGroup):
-    position = State()
+    title = State()
     schedule = State()
     salary = State()
     location = State()
     contacts = State()
-    description = State()  # "О себе"
+    description = State()
+
     media_choice = State()
-    waiting_media = State()
+    media_wait = State()
+    media_confirm = State()
+
     preview = State()
-
-class ModRejectionForm(StatesGroup):
-    awaiting_reason = State()
-

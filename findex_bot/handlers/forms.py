@@ -1,665 +1,393 @@
-# === forms.py ===
+# findex_bot/handlers/forms.py
 from __future__ import annotations
 
-import uuid
 import logging
-from typing import Optional, Tuple
+from datetime import datetime, timezone
+from typing import Any, Optional
 
 from aiogram import Router, F
-from aiogram.enums import ParseMode
-from aiogram.fsm.context import FSMContext
 from aiogram.types import (
     CallbackQuery,
+    TelegramObject,
     InlineKeyboardMarkup,
     InlineKeyboardButton,
-    LinkPreviewOptions,
 )
+from aiogram.dispatcher.middlewares.base import BaseMiddleware
 
-from findex_bot.states.vacancies import EmployerForm, SeekerForm
+import findex_bot.runtime as runtime
+from findex_bot.db.db import get_sessionmaker
+from findex_bot.db.repo import AdRepo
 from findex_bot.utils.ui_utils import (
-    moderation_keyboard,
-    rejection_keyboard,
-    send_ad_preview,
-    get_full_edit_keyboard,
-    NOOP_CALLBACK,
+    safe_answer,
+    employer_preview_keyboard,
+    seeker_preview_keyboard,
+    DAILY_FREE_LIMIT,
+    is_unlimited_user,
+    utc_day_key,
+    utc_seconds_to_reset,
+    format_hhmmss,
 )
+from findex_bot.utils.vacancy_utils import get_ad_text
+from findex_bot.handlers.alerts import fire_alerts_on_publish
 
 logger = logging.getLogger(__name__)
-
 router = Router()
 
-# ------------------------------------------------------
-# SAFE ANSWER / SAFE EDIT
-# ------------------------------------------------------
+
+class SavedHintMiddleware(BaseMiddleware):
+    async def __call__(self, handler, event: TelegramObject, data: dict):
+        return await handler(event, data)
 
 
-async def _safe_answer(callback: CallbackQuery, text: str | None = None, show_alert: bool = False):
-    try:
-        if text is None:
-            await callback.answer()
-        else:
-            await callback.answer(text, show_alert=show_alert)
-    except Exception:
-        pass
+# ---------------------------
+# ✅ ДОП.ИНФО ДЛЯ МОДЕРАЦИИ
+# ---------------------------
+def _moderator_label(cb: CallbackQuery) -> str:
+    u = cb.from_user
+    if u and u.username:
+        return f"@{u.username}"
+    if u:
+        return f"<code>{u.id}</code>"
+    return "—"
 
 
-async def _safe_edit(
-    callback: CallbackQuery,
-    text: str,
-    reply_markup: InlineKeyboardMarkup | None = None,
-    parse_mode: ParseMode | None = None,
-    disable_preview: bool = False,
-    allow_fallback: bool = True,  # allow_fallback=False → не создаём новое сообщение (важно для мод-чата)
-):
-    msg = callback.message
-    try:
-        # Текстовое сообщение
-        if getattr(msg, "text", None):
-            return await msg.edit_text(
-                text,
-                reply_markup=reply_markup,
-                parse_mode=parse_mode,
-                link_preview_options=LinkPreviewOptions(is_disabled=True) if disable_preview else None,
-            )
-
-        # Фото/видео сообщение (caption)
-        if getattr(msg, "caption", None) is not None:
-            return await msg.edit_caption(
-                caption=text,
-                reply_markup=reply_markup,
-                parse_mode=parse_mode,
-            )
-    except Exception:
-        if not allow_fallback:
-            return None
-
-    if allow_fallback:
-        try:
-            return await callback.bot.send_message(
-                chat_id=msg.chat.id,
-                text=text,
-                reply_markup=reply_markup,
-                parse_mode=parse_mode,
-                link_preview_options=LinkPreviewOptions(is_disabled=True) if disable_preview else None,
-            )
-        except Exception:
-            return None
+def _publish_info_block(cb: CallbackQuery, public_url: str | None) -> str:
+    url = public_url or "—"
+    return f"\n\n✅ Опубликовано!\nМодератор: {_moderator_label(cb)}\nСсылка: {url}"
 
 
-def _get_msg_text_or_caption(callback: CallbackQuery) -> str:
-    msg = callback.message
-    return (getattr(msg, "text", None) or getattr(msg, "caption", None) or "").strip()
+def _strip_publish_info(text: str) -> str:
+    if not text:
+        return text
+    marker = "\n\n✅ Опубликовано!"
+    if marker in text:
+        return text.split(marker)[0]
+    return text
 
 
-def _append_once(base: str, add: str) -> str:
-    add_clean = (add or "").strip()
-    if not add_clean:
-        return base
-    if add_clean in (base or ""):
-        return base
-    return f"{base.rstrip()}\n\n{add_clean}" if (base or "").strip() else add_clean
-
-
-# ------------------------------------------------------
-# CORE ACCESS
-# ------------------------------------------------------
-
-
-def _core():
-    # ВАЖНО: импорт внутри функции — так мы избегаем циклических импортов
-    from findex_bot import bot
-    return bot
-
-
-def _get_pending_storage():
-    c = _core()
-    c.ADS_PENDING = getattr(c, "ADS_PENDING", {}) or {}
-    return c.ADS_PENDING
-
-
-def _get_rejected_storage():
-    c = _core()
-    c.ADS_REJECTED = getattr(c, "ADS_REJECTED", {}) or {}
-    return c.ADS_REJECTED
-
-
-def _get_published_storage():
-    """
-    В bot.py у тебя это называется PUBLISHED_POSTS.
-    Делаем совместимо: если где-то раньше было ADS_PUBLISHED — тоже поддержим.
-    """
-    c = _core()
-    if hasattr(c, "PUBLISHED_POSTS"):
-        c.PUBLISHED_POSTS = getattr(c, "PUBLISHED_POSTS", {}) or {}
-        return c.PUBLISHED_POSTS
-    c.ADS_PUBLISHED = getattr(c, "ADS_PUBLISHED", {}) or {}
-    return c.ADS_PUBLISHED
-
-
-def _get_mod_chat_id() -> Optional[int]:
-    try:
-        return int(_core().config.moderation_chat_id)
-    except Exception:
-        return None
-
-
-def _get_main_channel_id() -> Optional[int]:
-    try:
-        return int(_core().config.main_channel_id)
-    except Exception:
-        return None
-
-
-def _get_channel_username() -> str:
-    try:
-        return (_core().config.channel_username or "").lstrip("@")
-    except Exception:
-        return ""
-
-
-# ------------------------------------------------------
-# LIMITS (3 бесплатных в день) — БЕЗ циклического импорта
-# ------------------------------------------------------
-
-
-def _limits_record_published(user_id: int) -> int | str | None:
-    """
-    Увеличивает счётчик ТОЛЬКО после успешной публикации.
-    Возвращает сколько осталось (0..3) или "∞".
-    """
-    try:
-        c = _core()
-        fn = getattr(c, "record_published", None)
-        if callable(fn):
-            return fn(int(user_id))
-    except Exception:
-        logger.exception("LIMITS: record_published failed user_id=%s", user_id)
-    return None
-
-
-def _limits_get_remaining(user_id: int) -> int | str | None:
-    """Сколько осталось сегодня (не увеличивает)."""
-    try:
-        c = _core()
-        fn = getattr(c, "get_remaining_today", None)
-        if callable(fn):
-            return fn(int(user_id))
-    except Exception:
-        logger.exception("LIMITS: get_remaining_today failed user_id=%s", user_id)
-    return None
-
-
-# ------------------------------------------------------
-# PARSERS
-# ------------------------------------------------------
-
-
-def _parse_ad_id(data: str) -> Optional[str]:
-    """
-    Поддержка:
-    mod_approve:<ad_id>
-    mod_reject:<ad_id>
-    open_post:<ad_id>
-    а также варианты с | и _
-    """
-    if not data:
-        return None
-    for sep in (":", "|", "_"):
-        if sep in data:
-            p = data.split(sep, 1)
-            if len(p) == 2 and p[1].strip():
-                return p[1].strip()
-    return None
-
-
-def _parse_mod_reason(data: str) -> Tuple[Optional[str], Optional[str]]:
-    """
-    mod_reason:<ad_id>:<field>
-    """
-    if not data or not data.startswith("mod_reason:"):
-        return None, None
-    parts = data.split(":")
-    if len(parts) >= 3:
-        return (parts[1].strip() or None, parts[2].strip() or None)
-    return None, None
-
-
-# ------------------------------------------------------
-# UI: LOCKED KEYBOARD (после отправки на модерацию)
-# ------------------------------------------------------
-
-
-def _locked_keyboard() -> InlineKeyboardMarkup:
-    # Одна кнопка-заглушка, остальные кнопки исчезают → редактирование невозможно
+# ---------------------------
+# ✅ ЮЗЕР: сообщение “как на скрине” + кнопка повтор
+# ---------------------------
+def _republish_kb(ad_id: int) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
-            [InlineKeyboardButton(text="⏳ Объявление отправлено на модерацию", callback_data=NOOP_CALLBACK)]
+            [InlineKeyboardButton(text="🔁 Повторить публикацию", callback_data=f"republish:{ad_id}")]
         ]
     )
 
 
-# ------------------------------------------------------
-# NOOP (кнопка заблокирована)
-# ------------------------------------------------------
+def _counter_store() -> dict:
+    store = getattr(runtime, "USER_PUB_COUNTER", None)
+    if store is None or not isinstance(store, dict):
+        store = {}
+        runtime.USER_PUB_COUNTER = store
+    return store
 
 
-@router.callback_query(F.data == NOOP_CALLBACK)
-async def noop_callback(callback: CallbackQuery):
-    await _safe_answer(callback, "⏳ Уже отправлено на модерацию", show_alert=True)
+def _get_user_daily_counter(user_id: int) -> int:
+    store = _counter_store()
+    key = f"{int(user_id)}:{utc_day_key()}"
+    try:
+        return int(store.get(key, 0) or 0)
+    except Exception:
+        return 0
 
 
-# ------------------------------------------------------
-# SEND TO MODERATION (ANTI-SPAM + сохраняем полный предпросмотр)
-# ------------------------------------------------------
+def _inc_user_daily_counter(user_id: int) -> int:
+    store = _counter_store()
+    key = f"{int(user_id)}:{utc_day_key()}"
+    current = int(store.get(key, 0) or 0) + 1
+    store[key] = current
+    return current
 
 
-@router.callback_query(F.data.in_(["seek_send_mod", "emp_send_mod"]))
-async def send_to_moderation(callback: CallbackQuery, state: FSMContext):
-    await _safe_answer(callback)
+def _user_publish_block(public_url: str | None, used_today: int, show_reset_timer: bool) -> str:
+    url = public_url or "—"
 
-    data = await state.get_data()
-    if data.get("on_moderation"):
-        await _safe_answer(callback, "⏳ Уже отправлено на модерацию", show_alert=True)
-        return
+    # отображение строго X/3 без “4/3”
+    shown_used = min(max(0, int(used_today)), DAILY_FREE_LIMIT)
 
-    mod_chat_id = _get_mod_chat_id()
-    if not mod_chat_id:
-        return
-
-    ad_id = uuid.uuid4().hex[:12]
-
-    payload = dict(data)
-    payload["author_id"] = callback.from_user.id
-
-    # сохраняем, какое сообщение у пользователя является предпросмотром (чтобы потом обновить ЕГО)
-    payload["user_chat_id"] = callback.from_user.id
-    payload["user_message_id"] = callback.message.message_id
-    payload["user_has_caption"] = (getattr(callback.message, "caption", None) is not None)
-
-    role = payload.get("role", "Работодатель")
-    payload["role"] = role
-
-    _get_pending_storage()[ad_id] = payload
-
-    # 1) в мод-чат — полноценная карточка
-    await send_ad_preview(
-        chat_id=mod_chat_id,
-        ad_data=payload,
-        bot=callback.bot,
-        reply_markup=moderation_keyboard(ad_id),
+    block = (
+        "\n\n✅ Опубликовано\n"
+        f"🔗 Ссылка: {url}\n\n"
+        f"📩 Бесплатные публикации сегодня (UTC): {shown_used}/{DAILY_FREE_LIMIT}\n"
     )
 
-    # 2) блокируем повторную отправку
-    await state.update_data(on_moderation=True)
+    if show_reset_timer:
+        left = format_hhmmss(utc_seconds_to_reset())
+        block += f"\n⏳ До сброса лимита (UTC): {left}\n"
 
-    # 3) У пользователя: ЛОЧИМ ВСЕ КНОПКИ ОДНОЙ ЗАГЛУШКОЙ (по задаче)
-    original_text = _get_msg_text_or_caption(callback)
-    if not original_text:
+    block += "\nℹ️ Чтобы создать новое объявление — нажми /start"
+    return block
+
+
+async def _send_user_published_message(cb: CallbackQuery, ad_id: int, public_url: str | None) -> None:
+    async with get_sessionmaker()() as session:
+        repo = AdRepo(session)
+        ad = await repo.get(ad_id)
+        if not ad:
+            return
+
+        payload = ad.payload or {}
+        author_id = (payload or {}).get("author_id") or getattr(ad, "author_user_id", None)
+        if not author_id:
+            return
+        author_id = int(author_id)
+
+        author_username = (payload or {}).get("author_username")
+        unlimited = is_unlimited_user(author_username)
+
+        used_today = _inc_user_daily_counter(author_id)
+
+        base_text = get_ad_text(ad)
+        show_timer = (not unlimited) and (used_today >= DAILY_FREE_LIMIT)
+        extra = _user_publish_block(public_url, used_today, show_timer)
+
+        photo_file_id = payload.get("photo_file_id")
+        video_file_id = payload.get("video_file_id")
+
         try:
-            from findex_bot.utils.vacancy_utils import get_ad_text
-            original_text = get_ad_text(payload, include_author=False)
-        except Exception:
-            original_text = "⏳ Объявление отправлено на модерацию"
-
-    await _safe_edit(
-        callback,
-        original_text,
-        reply_markup=_locked_keyboard(),
-        parse_mode=ParseMode.HTML,
-        disable_preview=True,
-        allow_fallback=True,  # пользователю можно fallback
-    )
-
-
-# ------------------------------------------------------
-# MODERATION: APPROVE
-# ------------------------------------------------------
-
-
-@router.callback_query(F.data.startswith("mod_approve"))
-async def mod_approve_callback(callback: CallbackQuery, state: FSMContext):
-    await _safe_answer(callback)
-
-    ad_id = _parse_ad_id(callback.data or "")
-    if not ad_id:
-        return
-
-    pending = _get_pending_storage()
-    ad = pending.get(ad_id)
-    if not ad:
-        return
-
-    main_channel = _get_main_channel_id()
-    if not main_channel:
-        return
-
-    # текст объявления
-    try:
-        from findex_bot.utils.vacancy_utils import get_ad_text
-        text = get_ad_text(ad, include_author=False)
-    except Exception:
-        text = ""
-
-    # публикуем (с медиа, если оно есть)
-    media_id = ad.get("media_id")
-    media_type = ad.get("media_type")
-
-    if media_id and media_type == "photo":
-        sent = await callback.bot.send_photo(
-            chat_id=main_channel,
-            photo=media_id,
-            caption=text,
-            parse_mode=ParseMode.HTML,
-        )
-    elif media_id and media_type == "video":
-        sent = await callback.bot.send_video(
-            chat_id=main_channel,
-            video=media_id,
-            caption=text,
-            parse_mode=ParseMode.HTML,
-        )
-    else:
-        sent = await callback.bot.send_message(
-            chat_id=main_channel,
-            text=text,
-            parse_mode=ParseMode.HTML,
-        )
-
-    username = _get_channel_username()
-    url = f"https://t.me/{username}/{sent.message_id}" if username else ""
-
-    _get_published_storage()[ad_id] = {
-        "chat_id": main_channel,
-        "message_id": sent.message_id,
-        "url": url,
-    }
-
-    # ✅ фиксируем лимит ПОСЛЕ успешной публикации
-    author_id = ad.get("author_id") or ad.get("user_chat_id")
-    remaining_after = None
-    if author_id:
-        remaining_after = _limits_record_published(int(author_id))
-
-    # --------------------------------------------------
-    # 1) ОБНОВЛЯЕМ ПРЕДПРОСМОТР У ПОЛЬЗОВАТЕЛЯ (В ЭТОМ ЖЕ СООБЩЕНИИ)
-    #    reply_markup=None (после публикации кнопки не нужны)
-    # --------------------------------------------------
-    try:
-        user_chat_id = ad.get("user_chat_id") or ad.get("author_id")
-        user_message_id = ad.get("user_message_id")
-        user_has_caption = bool(ad.get("user_has_caption"))
-
-        parts = []
-        parts.append("✅ <b>Опубликовано</b>")
-
-        if url:
-            parts.append(f"🔗 Ссылка: {url}")
-
-        if remaining_after is None and user_chat_id:
-            remaining_after = _limits_get_remaining(int(user_chat_id))
-
-        if remaining_after is not None:
-            if remaining_after == "∞":
-                parts.append("📩 Бесплатные публикации сегодня: ∞")
+            if video_file_id:
+                caption = base_text + extra
+                if len(caption) > 1024:
+                    caption = caption[:1021] + "…"
+                await cb.bot.send_video(author_id, video=video_file_id, caption=caption, reply_markup=_republish_kb(ad_id))
+            elif photo_file_id:
+                caption = base_text + extra
+                if len(caption) > 1024:
+                    caption = caption[:1021] + "…"
+                await cb.bot.send_photo(author_id, photo=photo_file_id, caption=caption, reply_markup=_republish_kb(ad_id))
             else:
-                parts.append(f"📩 Бесплатные публикации сегодня: {int(remaining_after)}/3")
-
-        parts.append("ℹ️ Чтобы создать новое объявление — нажми /start")
-
-        status_user = "\n\n" + "\n\n".join(parts)
-        final_text = (text or "").strip() + status_user
-
-        if user_chat_id and user_message_id:
-            if user_has_caption:
-                await callback.bot.edit_message_caption(
-                    chat_id=int(user_chat_id),
-                    message_id=int(user_message_id),
-                    caption=final_text,
-                    parse_mode=ParseMode.HTML,
-                    reply_markup=None,
-                )
-            else:
-                await callback.bot.edit_message_text(
-                    chat_id=int(user_chat_id),
-                    message_id=int(user_message_id),
-                    text=final_text,
-                    parse_mode=ParseMode.HTML,
-                    reply_markup=None,
-                    link_preview_options=LinkPreviewOptions(is_disabled=True),
-                )
-    except Exception:
-        logger.exception(
-            "APPROVE: failed to update user preview ad_id=%s user_chat_id=%s user_message_id=%s user_has_caption=%s",
-            ad_id,
-            ad.get("user_chat_id"),
-            ad.get("user_message_id"),
-            ad.get("user_has_caption"),
-        )
-
-    # --------------------------------------------------
-    # 2) В МОД-ЧАТЕ ОБНОВЛЯЕМ СООБЩЕНИЕ СТАТУСОМ (служебно, как и было)
-    # --------------------------------------------------
-    moderator_u = callback.from_user.username
-    moderator_text = f"@{moderator_u}" if moderator_u else f"id{callback.from_user.id}"
-
-    status_mod = (
-        "✅ Опубликовано!\n"
-        f"Модератор: {moderator_text}\n"
-        f"Ссылка: {url}"
-    )
-
-    new_text = _append_once(_get_msg_text_or_caption(callback), status_mod)
-
-    await _safe_edit(
-        callback,
-        new_text,
-        reply_markup=None,
-        parse_mode=ParseMode.HTML,
-        disable_preview=True,
-        allow_fallback=False,  # мод-чат — никаких новых сообщений
-    )
-
-    pending.pop(ad_id, None)
-
-
-# ------------------------------------------------------
-# MODERATION: REJECT (меняем только клавиатуру причин)
-# ------------------------------------------------------
-
-
-@router.callback_query(F.data.startswith("mod_reject"))
-async def mod_reject_callback(callback: CallbackQuery, state: FSMContext):
-    await _safe_answer(callback)
-
-    ad_id = _parse_ad_id(callback.data or "")
-    if not ad_id:
-        return
-
-    await state.clear()
-    await state.update_data(mod_reject_ad_id=ad_id)
-
-    try:
-        await callback.message.edit_reply_markup(reply_markup=rejection_keyboard(ad_id))
-    except Exception:
-        original = _get_msg_text_or_caption(callback)
-        await _safe_edit(
-            callback,
-            original,
-            reply_markup=rejection_keyboard(ad_id),
-            parse_mode=ParseMode.HTML,
-            disable_preview=True,
-            allow_fallback=False,  # мод-чат
-        )
-
-
-# ------------------------------------------------------
-# MODERATION: REASON → отклоняем и возвращаем автору на правку
-# ------------------------------------------------------
-
-
-def _reason_text(field: str) -> str:
-    m = {
-        "position": "Должность некорректная",
-        "schedule": "График некорректный",
-        "salary": "Зарплата некорректная",
-        "location": "Локация некорректная",
-        "contacts": "Контакты некорректные",
-        "description": "Описание неправильное",
-        "custom": "Другая причина",
-    }
-    return m.get(field, "Другая причина")
-
-
-def _make_fix_keyboard(ad_id: str, field: str) -> InlineKeyboardMarkup:
-    titles = {
-        "position": "Должность",
-        "schedule": "График",
-        "salary": "Зарплата",
-        "location": "Локация",
-        "contacts": "Контакты",
-        "description": "Описание",
-        "custom": "Другое",
-    }
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
-            [
-                InlineKeyboardButton(
-                    text=f"✏️ Исправить: {titles.get(field, 'Поле')}",
-                    callback_data=f"fix_rej:{ad_id}:{field}",
-                )
-            ]
-        ]
-    )
-
-
-@router.callback_query(F.data.startswith("mod_reason:"))
-async def mod_reason_callback(callback: CallbackQuery, state: FSMContext):
-    await _safe_answer(callback)
-
-    ad_id, field = _parse_mod_reason(callback.data or "")
-    if not ad_id:
-        st = await state.get_data()
-        ad_id = st.get("mod_reject_ad_id")
-
-    if not ad_id:
-        return
-
-    field = (field or "custom").lower().strip()
-    reason = _reason_text(field)
-
-    pending = _get_pending_storage()
-    ad = pending.get(ad_id)
-    if not ad:
-        await state.clear()
-        return
-
-    author_id = ad.get("author_id")
-
-    _get_rejected_storage()[ad_id] = ad
-    pending.pop(ad_id, None)
-
-    if author_id:
-        try:
-            await callback.bot.send_message(
-                chat_id=int(author_id),
-                text=(
-                    "❌ Объявление отклонено модератором.\n\n"
-                    f"Причина: <b>{reason}</b>\n\n"
-                    "Нажми кнопку ниже, чтобы сразу исправить."
-                ),
-                parse_mode=ParseMode.HTML,
-                reply_markup=_make_fix_keyboard(ad_id, field),
-            )
+                await cb.bot.send_message(author_id, base_text + extra, reply_markup=_republish_kb(ad_id))
         except Exception:
             pass
 
-    status = f"✖ Отклонено: причина — {reason}"
-    base = _get_msg_text_or_caption(callback)
-    new_text = _append_once(base, status)
 
-    await _safe_edit(
-        callback,
-        new_text,
-        reply_markup=None,
-        parse_mode=ParseMode.HTML,
-        disable_preview=True,
-        allow_fallback=False,
-    )
-
-    await state.clear()
+# ---------------------------
+# ✅ Репост: создать НОВЫЙ draft-клон и показать предпросмотр с кнопкой “Отправить на модерацию”
+# ---------------------------
+def _detect_role(payload: dict) -> str:
+    role = (payload.get("role") or "").strip().lower()
+    if role in ("employer", "seeker"):
+        return role
+    return "employer"
 
 
-# ------------------------------------------------------
-# AUTHOR: FIX AFTER REJECTION → снимаем блокировку + force_preview
-# ------------------------------------------------------
+def _preview_keyboard_for_role(role: str, ad_id: int) -> InlineKeyboardMarkup:
+    return seeker_preview_keyboard(ad_id) if role == "seeker" else employer_preview_keyboard(ad_id)
 
 
-@router.callback_query(F.data.startswith("fix_rej:"))
-async def fix_rejected_ad(callback: CallbackQuery, state: FSMContext):
-    await _safe_answer(callback)
+async def _send_preview_to_user(cb: CallbackQuery, ad_id: int, role: str, payload: dict, text: str) -> None:
+    kb = _preview_keyboard_for_role(role, ad_id)
 
-    parts = (callback.data or "").split(":")
-    if len(parts) < 3:
-        return
-
-    ad_id = parts[1].strip()
-    field = parts[2].strip().lower()
-
-    rejected = _get_rejected_storage()
-    ad_data = rejected.get(ad_id)
-    if not ad_data:
-        await _safe_answer(callback, "Объявление не найдено", show_alert=True)
-        return
-
-    role = ad_data.get("role", "Работодатель")
-
-    # ✅ Грузим данные, снимаем блокировку и включаем принудительный предпросмотр
-    await state.clear()
-    await state.update_data(**ad_data)
-    await state.update_data(on_moderation=False, is_inline_edit=True, force_preview=True)
-
-    if role == "Соискатель":
-        mapping = {
-            "position": SeekerForm.position,
-            "schedule": SeekerForm.schedule,
-            "salary": SeekerForm.salary,
-            "location": SeekerForm.location,
-            "contacts": SeekerForm.contacts,
-            "description": SeekerForm.description,
-        }
-    else:
-        mapping = {
-            "position": EmployerForm.position,
-            "salary": EmployerForm.salary,
-            "location": EmployerForm.location,
-            "contacts": EmployerForm.contacts,
-            "description": EmployerForm.description,
-        }
-
-    target_state = mapping.get(field)
-    if not target_state:
-        await _safe_answer(callback, "Поле не поддерживается", show_alert=True)
-        return
-
-    await state.set_state(target_state)
-
-    prompts = {
-        "position": "Введи исправленную 👤 должность:",
-        "schedule": "Введи исправленный 🕒 график:",
-        "salary": "Введи исправленную 💲 зарплату:",
-        "location": "Введи исправленную 📍 локацию:",
-        "contacts": "Введи исправленные ☎️ контакты:",
-        "description": "Введи исправленное 📝 описание:",
-        "custom": "Введи исправления:",
-    }
+    photo_file_id = payload.get("photo_file_id")
+    video_file_id = payload.get("video_file_id")
 
     try:
-        await callback.message.answer(prompts.get(field, "Введи исправленное значение:"))
+        if video_file_id:
+            caption = text
+            if len(caption) > 1024:
+                caption = caption[:1021] + "…"
+            await cb.bot.send_video(cb.from_user.id, video=video_file_id, caption=caption, reply_markup=kb)
+            return
+
+        if photo_file_id:
+            caption = text
+            if len(caption) > 1024:
+                caption = caption[:1021] + "…"
+            await cb.bot.send_photo(cb.from_user.id, photo=photo_file_id, caption=caption, reply_markup=kb)
+            return
+
+        await cb.bot.send_message(cb.from_user.id, text, reply_markup=kb)
     except Exception:
         try:
-            await callback.bot.send_message(
-                chat_id=callback.from_user.id,
-                text=prompts.get(field, "Введи исправленное значение:"),
-            )
+            await cb.bot.send_message(cb.from_user.id, text, reply_markup=kb)
         except Exception:
             pass
+
+
+@router.callback_query(F.data.startswith("republish:"))
+async def republish_to_user(callback: CallbackQuery):
+    await safe_answer(callback)
+
+    try:
+        src_ad_id = int((callback.data or "").split(":")[1])
+    except Exception:
+        return await safe_answer(callback, "⚠️ Некорректные данные", alert=True)
+
+    async with get_sessionmaker()() as session:
+        repo = AdRepo(session)
+
+        src = await repo.get(src_ad_id)
+        if not src:
+            return await safe_answer(callback, "❌ Объявление не найдено", alert=True)
+
+        if getattr(src, "status", None) != "published":
+            return await safe_answer(callback, "⚠️ Это объявление ещё не опубликовано", alert=True)
+
+        src_payload = src.payload or {}
+        role = _detect_role(src_payload)
+
+        # ✅ создаём новый черновик
+        new_ad = await repo.get_or_create_draft(author_user_id=callback.from_user.id, role=role)
+
+        copy_payload: dict[str, Any] = {
+            "role": role,
+            "author_id": callback.from_user.id,
+            "author_username": (callback.from_user.username or "").lstrip("@").strip() or None,
+            "title": src_payload.get("title"),
+            "salary": src_payload.get("salary"),
+            "location": src_payload.get("location"),
+            "contacts": src_payload.get("contacts"),
+            "description": src_payload.get("description"),
+            "photo_file_id": src_payload.get("photo_file_id"),
+            "video_file_id": src_payload.get("video_file_id"),
+        }
+        if role == "seeker":
+            copy_payload["schedule"] = src_payload.get("schedule")
+
+        # чистим мету
+        copy_payload["published"] = False
+        copy_payload["on_moderation"] = False
+        copy_payload["sent_to_moderation"] = False
+        copy_payload["approved_by"] = None
+        copy_payload["main_message_id"] = None
+        copy_payload["main_channel_id"] = None
+        copy_payload["moderation_chat_id"] = None
+        copy_payload["moderation_message_id"] = None
+        copy_payload["public_url"] = None
+
+        await repo.patch_payload(new_ad.id, **copy_payload)
+        await repo.set_status(new_ad.id, "draft")
+
+        preview_text = get_ad_text(new_ad)
+        await _send_preview_to_user(callback, new_ad.id, role, copy_payload, preview_text)
+
+    return await safe_answer(callback, "✅ Предпросмотр создан. Нажми «Отправить на модерацию».", alert=True)
+
+
+@router.callback_query(F.data.startswith("approve:"))
+async def approve_ad(callback: CallbackQuery):
+    await safe_answer(callback)
+
+    try:
+        ad_id = int((callback.data or "").split(":")[1])
+    except Exception:
+        return await safe_answer(callback, "⚠️ Некорректные данные", alert=True)
+
+    channel_id = int(getattr(runtime, "MAIN_CHANNEL_ID", 0) or 0)
+    channel_username = str(getattr(runtime, "CHANNEL_USERNAME", "") or "").lstrip("@").strip()
+
+    if channel_id == 0:
+        return await safe_answer(callback, "⚠️ MAIN_CHANNEL_ID не настроен", alert=True)
+
+    async with get_sessionmaker()() as session:
+        repo = AdRepo(session)
+        ad = await repo.get(ad_id)
+        if not ad:
+            return await safe_answer(callback, "❌ Объявление не найдено", alert=True)
+
+        if ad.status == "published":
+            return await safe_answer(callback, "⚠️ Уже опубликовано", alert=True)
+
+        payload = ad.payload or {}
+        author_id = (payload or {}).get("author_id") or getattr(ad, "author_user_id", None)
+        author_username = (payload or {}).get("author_username")
+
+        # ✅ ЖЁСТКИЙ СТОП ЛИМИТА НА approve (защита от “4/3” навсегда)
+        if author_id and (not is_unlimited_user(author_username)):
+            published = _get_user_daily_counter(int(author_id))
+            if published >= DAILY_FREE_LIMIT:
+                left = format_hhmmss(utc_seconds_to_reset())
+                warn = (
+                    f"⛔ Лимит публикаций исчерпан ({published}/{DAILY_FREE_LIMIT}).\n"
+                    f"До сброса (UTC): {left}"
+                )
+
+                # уведомление модератору
+                try:
+                    if callback.message:
+                        if callback.message.caption is not None:
+                            base = _strip_publish_info(callback.message.caption)
+                            new_caption = base + f"\n\n{warn}"
+                            if len(new_caption) > 1024:
+                                new_caption = new_caption[:1021] + "…"
+                            await callback.message.edit_caption(caption=new_caption, reply_markup=None)
+                        else:
+                            base = _strip_publish_info(callback.message.text or "")
+                            await callback.message.edit_text(base + f"\n\n{warn}", reply_markup=None)
+                except Exception:
+                    pass
+
+                # уведомление автору
+                try:
+                    await callback.bot.send_message(int(author_id), warn)
+                except Exception:
+                    pass
+
+                return await safe_answer(callback, "⛔ Лимит исчерпан", alert=True)
+
+        text = get_ad_text(ad)
+        photo_file_id = payload.get("photo_file_id")
+        video_file_id = payload.get("video_file_id")
+
+        # 1) Публикация в канал
+        try:
+            if video_file_id:
+                msg = await callback.bot.send_video(channel_id, video=video_file_id, caption=text)
+            elif photo_file_id:
+                msg = await callback.bot.send_photo(channel_id, photo=photo_file_id, caption=text)
+            else:
+                msg = await callback.bot.send_message(channel_id, text)
+        except Exception:
+            logger.exception("publish to channel failed")
+            return await safe_answer(callback, "❌ Ошибка публикации в канал", alert=True)
+
+        # 2) public_url
+        public_url: Optional[str] = None
+        if channel_username:
+            public_url = f"https://t.me/{channel_username}/{msg.message_id}"
+
+        # 3) фиксируем published + url + мету
+        await repo.set_status(ad.id, "published")
+        await repo.set_public_url(ad.id, public_url)
+        await repo.patch_payload(
+            ad.id,
+            approved_by=callback.from_user.id if callback.from_user else None,
+            main_message_id=msg.message_id,
+            main_channel_id=channel_id,
+            published=True,
+            on_moderation=False,
+            sent_to_moderation=False,
+            public_url=public_url,
+        )
+
+        # 4) доп-инфо в сообщении модерации
+        try:
+            if callback.message:
+                add = _publish_info_block(callback, public_url)
+                if callback.message.caption is not None:
+                    base = _strip_publish_info(callback.message.caption)
+                    new_caption = base + add
+                    if len(new_caption) > 1024:
+                        new_caption = new_caption[:1021] + "…"
+                    await callback.message.edit_caption(caption=new_caption, reply_markup=None)
+                else:
+                    base = _strip_publish_info(callback.message.text or "")
+                    await callback.message.edit_text(base + add, reply_markup=None)
+        except Exception:
+            pass
+
+        # 5) сообщение юзеру + кнопка republish (и таймер только после 3-й публикации)
+        try:
+            await _send_user_published_message(callback, ad.id, public_url)
+        except Exception:
+            pass
+
+        # 6) алерты после публикации
+        try:
+            await fire_alerts_on_publish(callback.bot, ad, url=public_url)
+        except Exception:
+            logger.exception("alerts failed")
+
+    return await safe_answer(callback, "✅ Опубликовано", alert=True)

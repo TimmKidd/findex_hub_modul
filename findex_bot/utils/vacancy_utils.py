@@ -1,147 +1,99 @@
+# findex_bot/utils/vacancy_utils.py
+from __future__ import annotations
+
 import re
-import datetime
-
-# --- Набор матов / запрещённых слов ---
-# Делаем по корням, чтобы ловить разные формы:
-# "жопа", "жопой", "жопы" → "жоп"
-# "хуй", "хуйня", "хуёво" → "хуй"
-BAD_WORD_PATTERNS = [
-    "жоп",
-    "хуй",
-    "пизд",
-    "еба",
-    "ебал",
-    "сука",
-    "бля",
-    "бляд",
-]
+from typing import Any
 
 
-def normalize_text(text: str) -> str:
-    """
-    Нормализуем текст:
-    - приводим к нижнему регистру
-    - заменяем тире/длинные тире и прочие разделители на пробел
-    """
-    if not text:
-        return ""
-
-    lowered = text.lower()
-
-    # заменяем разные тире/слэш и т.п. на пробел
-    for ch in ["—", "-", "_", "/", "\\"]:
-        lowered = lowered.replace(ch, " ")
-
-    return lowered
-
-
-def contains_bad_words(text: str) -> bool:
-    """
-    Проверяет, есть ли в тексте мат.
-    Возвращает True, если найдено хоть одно запрещённое слово.
-    """
-    if not text:
-        return False
-
-    normalized = normalize_text(text)
-
-    # Проверяем по подстроке, чтобы ловить "хуйня", "жопа", "жопой" и т.п.
-    for pattern in BAD_WORD_PATTERNS:
-        if pattern in normalized:
-            return True
-
-    return False
-
-
-def is_valid_city_input(city: str) -> bool:
-    """
-    Проверяет корректность ввода города.
-
-    Правила (под тесты и твой ТЗ):
-    - только КИРИЛЛИЦА (русские буквы) + пробелы + тире
-    - без цифр
-    - без латиницы
-    - без смайлов и спецсимволов
-
-    Примеры:
-    - "Москва"      → True
-    - "Санкт-Петербург" → True
-    - "Нижний Новгород" → True
-    - "Hello"       → False
-    - "Москва123"   → False
-    """
-    if not city:
-        return False
-
-    city = city.strip()
-
-    # Только русские буквы + пробелы + дефис
-    pattern = r"[А-Яа-яЁё\s\-]+"
-
-    return bool(re.fullmatch(pattern, city))
+def _p(ad_or_payload: Any) -> dict:
+    if ad_or_payload is None:
+        return {}
+    if isinstance(ad_or_payload, dict):
+        return dict(ad_or_payload)
+    payload = getattr(ad_or_payload, "payload", None)
+    return dict(payload) if isinstance(payload, dict) else {}
 
 
 def make_hashtag(text: str) -> str:
-    """
-    Делает хэштег из строки:
-    - убирает все символы, кроме букв и цифр (латиница + кириллица)
-    - склеивает
-    - добавляет # в начало, если что-то осталось
-    """
     if not text:
         return ""
-
     cleaned = re.sub(r"[^0-9A-Za-zА-Яа-яЁё]+", "", text)
     return f"#{cleaned}" if cleaned else ""
 
 
-def get_ad_text(data: dict, include_author: bool = False) -> str:
+def get_ad_text(ad_or_payload: Any) -> str:
     """
-    Формирует текст объявления для публикации / модерации.
+    Предпросмотр/публикация: строго как на скрине.
 
-    Поддерживает две роли:
-    - Работодатель
-    - Соискатель
+    Заголовок:
+      Работодатель / Соискатель
 
-    Структура подогнана под текущую логику бота и тесты.
+    Далее строки (одной колонкой):
+      👤 Должность: ...
+      🕒 График: ... (только seeker)
+      💲 Зарплата: ...
+      📍 Локация: ...
+      📞 Контакты: ...
+      📝 О себе/Описание:
+      <текст>
+
+    В конце:
+      #FindexHub #<должность> #<локация>
     """
-    role = data.get("role", "Работодатель")
-    position = data.get("position", "")
-    location = data.get("location", "")
-    salary = data.get("salary", "")
-    contacts = data.get("contacts", "")
-    description = data.get("description", "")
-    schedule = data.get("schedule", "")
+    payload = _p(ad_or_payload)
+    role = (payload.get("role") or getattr(ad_or_payload, "role", None) or "employer").strip()
 
-    tags = f"#FindexHub {make_hashtag(position)} {make_hashtag(location)}".strip()
+    title = (payload.get("title") or "").strip()
+    salary = (payload.get("salary") or "").strip()
+    location = (payload.get("location") or "").strip()
+    contacts = (payload.get("contacts") or "").strip()
+    description = (payload.get("description") or "").strip()
+    schedule = (payload.get("schedule") or "").strip()
 
-    if role == "Соискатель":
-        # Для соискателя ОБЯЗАТЕЛЬНО есть строка с графиком (schedule),
-        # чтобы проходил тест test_get_ad_text_seeker.
-        text = (
-            f"{role}\n\n"
-            f"👤 Должность: {position}\n"
+    tags = f"#FindexHub {make_hashtag(title)} {make_hashtag(location)}".strip()
+
+    if role == "seeker":
+        return (
+            "Соискатель\n\n"
+            f"👤 Должность: {title}\n"
             f"🕒 График: {schedule}\n"
             f"💲 Зарплата: {salary}\n"
             f"📍 Локация: {location}\n"
-            f"☎️ Контакты: {contacts}\n"
-            f"📝 О себе:\n{description}\n\n"
-            f"{tags}"
-        )
-    else:
-        # Работодатель
-        text = (
-            f"{role}\n\n"
-            f"👤 Должность: {position}\n"
-            f"💲 Зарплата: {salary}\n"
-            f"📍 Локация: {location}\n"
-            f"☎️ Контакты: {contacts}\n"
-            f"📝 Описание:\n{description}\n\n"
+            f"📞 Контакты: {contacts}\n"
+            "📝 О себе:\n"
+            f"{description}\n\n"
             f"{tags}"
         )
 
-    if include_author and data.get("author"):
-        text += f"\n\nАвтор: {data.get('author')}"
+    return (
+        "Работодатель\n\n"
+        f"👤 Должность: {title}\n"
+        f"💲 Зарплата: {salary}\n"
+        f"📍 Локация: {location}\n"
+        f"📞 Контакты: {contacts}\n"
+        "📝 Описание:\n"
+        f"{description}\n\n"
+        f"{tags}"
+    )
 
-    return text
 
+# ------------------------------------------------------------
+# ✅ Совместимость: form_handlers.py ожидает contains_bad_words()
+# ------------------------------------------------------------
+def contains_bad_words(text: str) -> bool:
+    """
+    Возвращает True если в тексте обнаружены запрещённые слова.
+    Сейчас это совместимость, чтобы бот не падал на импорте.
+
+    1) Если в runtime есть BAD_WORDS (список слов) — используем его.
+    2) Если нет — считаем, что плохих слов нет (False).
+    """
+    try:
+        import findex_bot.runtime as runtime  # локальный импорт, чтобы избежать циклов
+        bad = getattr(runtime, "BAD_WORDS", None)
+        if not bad:
+            return False
+        t = (text or "").lower()
+        return any(str(w).lower() in t for w in bad)
+    except Exception:
+        return False
