@@ -1,0 +1,51 @@
+# --- secrets ---
+.env
+env.dev
+env.prod
+*.env
+
+# --- backups / dumps ---
+backups/
+*.sql
+*.tar.gz
+
+# --- local stuff ---
+*.log
+run/
+support_bot/.env
+
+# --- secrets / env files ---
+*.local
+
+# support bot secrets
+support_bot/env.dev
+support_bot/env.prod
+
+# backups may contain secrets
+backups/*.env*
+backups/*before_env*
+backups/*before_profiles*
+backups/*before_secrets*
+backups/*supervisord.conf.before_env*
+
+# --- OS / IDE junk ---
+.DS_Store
+**/.DS_Store
+
+# --- Python junk ---
+__pycache__/
+**/__pycache__/
+*.pyc
+
+# --- venv ---
+venv/
+.venv/
+
+# --- runtime logs/pids ---
+run/*.log
+run/*.pid
+run/*.sock
+
+
+
+# --- backups (may contain secrets) ---
