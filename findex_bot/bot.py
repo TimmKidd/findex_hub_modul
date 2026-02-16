@@ -31,7 +31,7 @@ class Config:
 
 
 def load_config() -> Config:
-    load_dotenv("/Users/tmkd/Desktop/tmkd/FindexHub/.env")
+    load_dotenv("/Users/tmkd/Desktop/tmkd/FindexHub/.env", override=True)
 
     token = os.getenv("BOT_TOKEN")
     if not token:
@@ -86,7 +86,7 @@ from findex_bot.handlers.menu import router as menu_router
 from findex_bot.handlers.help import router as help_router
 from findex_bot.handlers.diagnostics import router as diagnostics_router
 
-# ✅ модерация — раньше всех, чтобы никакие forms не перехватывали reject:
+# модерация — раньше forms
 from findex_bot.handlers.moderation import router as moderation_router
 
 from findex_bot.handlers.forms import router as forms_router
@@ -112,9 +112,8 @@ def build_bot() -> Bot:
     )
 
 
+# ---------------- REDIS INIT (ИСПРАВЛЕНО) ----------------
 async def _init_redis():
-    redis_url = os.getenv("REDIS_URL", "redis://localhost:6379/0")
-
     try:
         import redis.asyncio as redis  # type: ignore
     except Exception:
@@ -122,11 +121,25 @@ async def _init_redis():
         logging.warning("⚠️ redis package not installed -> alerts will use in-memory fallback")
         return
 
+    # 1️⃣ если есть REDIS_URL — используем его
+    redis_url = os.getenv("REDIS_URL")
+
+    # 2️⃣ иначе собираем из отдельных переменных
+    if not redis_url:
+        host = os.getenv("REDIS_HOST", "127.0.0.1")
+        port = os.getenv("REDIS_PORT", "6379")
+        password = os.getenv("REDIS_PASSWORD")
+
+        if password:
+            redis_url = f"redis://:{password}@{host}:{port}/0"
+        else:
+            redis_url = f"redis://{host}:{port}/0"
+
     try:
         r = redis.from_url(redis_url, decode_responses=True)
         await r.ping()
         runtime.REDIS = r
-        logging.info(f"✅ Redis connected: {redis_url}")
+        logging.info("✅ Redis connected")
     except Exception:
         runtime.REDIS = None
         logging.exception("⚠️ Redis not available -> alerts will use in-memory fallback")
@@ -180,7 +193,7 @@ async def main():
     dp.include_router(diagnostics_router)
     dp.include_router(start_router)
 
-    # ✅ approve/reject/rejr — СНАЧАЛА модерация
+    # approve/reject — сначала модерация
     dp.include_router(moderation_router)
 
     dp.include_router(forms_router)
