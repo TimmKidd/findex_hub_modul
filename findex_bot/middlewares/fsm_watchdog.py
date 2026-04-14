@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import asyncio
+
 import os
 import time
 import logging
@@ -9,6 +11,9 @@ from typing import Any, Awaitable, Callable, Optional
 
 from aiogram import BaseMiddleware
 from aiogram.types import Message, CallbackQuery
+from findex_bot.states.vacancies import EmployerForm, SeekerForm
+from findex_bot.handlers.responds import RespondFSM
+from findex_bot.handlers.responds import RespondFSM
 from aiogram.fsm.context import FSMContext
 
 logger = logging.getLogger(__name__)
@@ -41,6 +46,53 @@ def _get_cooldown_sec() -> int:
     except Exception:
         return DEFAULT_COOLDOWN_SEC
 
+
+
+
+async def _delete_message_later(msg: Message, delay_sec: float = 2.5) -> None:
+    try:
+        await asyncio.sleep(delay_sec)
+        await msg.delete()
+    except Exception:
+        pass
+
+
+
+def _clean_thread_hint_for_state(current_state: str, hint_key: str | None = None) -> str:
+    hk = str(hint_key or "").strip().lower()
+    s = str(current_state or "")
+
+    if hk == "contact_mode":
+        return "Нажми одну из кнопок выше: 🔒 Отклики через бота или 📞 Контакты в объявлении."
+
+    if hk == "media_choice":
+        return "Нажми одну из кнопок выше: ➕ Добавить медиа или ⏭ Без медиа."
+
+    if hk == "media_wait":
+        return "Сейчас нужен файл: отправь фото или короткое видео."
+
+    if hk == "respond_intro_choice" or s.endswith(":form_intro_choice"):
+        return "👆 Нажми кнопку «⚡ Откликнуться за 1 минуту» выше."
+
+    if hk == "respond_saved_choice" or s.endswith(":form_saved_choice"):
+        return "Нажми одну из кнопок выше: ⚡ Быстрый отклик или ✏️ Заполнить заново."
+
+    if hk == "respond_form_preview" or s.endswith(":form_preview"):
+        return "Используй кнопки выше: измени поле или отправь отклик."
+
+    if s.endswith(":form_citizenship_pick"):
+        return "Здесь нужно выбрать гражданство кнопкой выше. Если страны нет в списке — нажми «🌍 Другая страна»."
+
+    if s.endswith(":media_confirm"):
+        return "Нажми одну из кнопок выше: ✅ Подтвердить, 🔁 Заменить или 🗑 Удалить."
+
+    if s.endswith(":preview"):
+        return "Используй кнопки выше: исправить поле, изменить медиа или отправить объявление на модерацию."
+
+    if s.endswith(":media_choice"):
+        return "Нажми одну из кнопок выше."
+
+    return "Нажми одну из кнопок выше."
 
 def _is_private_event(event: Any) -> bool:
     msg = None
@@ -114,6 +166,68 @@ class FSMWatchdogMiddleware(BaseMiddleware):
                 return await handler(event, data)
 
         current_state = await state.get_state()
+        st_data = await state.get_data()
+        if isinstance(event, Message):
+            try:
+                logger.warning(
+                    int(getattr(getattr(event, "from_user", None), "id", 0) or 0),
+                    current_state,
+                    sorted(list((st_data or {}).keys())),
+                    ((getattr(event, "text", None) or getattr(event, "caption", None) or "")[:120]),
+                )
+            except Exception:
+                pass
+
+        # CLEAN THREAD callback-only guard v2
+        if isinstance(event, Message):
+            callback_only_states = {
+                str(SeekerForm.preview),
+                str(SeekerForm.media_choice),
+                str(SeekerForm.media_confirm),
+                str(SeekerForm.media_wait),
+                str(EmployerForm.preview),
+                str(EmployerForm.media_choice),
+                str(EmployerForm.media_confirm),
+            }
+            current_state_s = str(current_state or "")
+            if (
+                current_state_s in callback_only_states
+                or current_state_s.endswith(":form_citizenship_pick")
+                or current_state_s.endswith(":form_preview")
+                or current_state_s.endswith(":form_saved_choice")
+                or current_state_s.endswith(":form_intro_choice")
+            ):
+                raw_text = ((getattr(event, "text", None) or getattr(event, "caption", None) or "")).strip()
+
+                # Do not eat slash-commands like /start
+                if raw_text.startswith("/"):
+                    return await handler(event, data)
+
+                try:
+                    await event.delete()
+                except Exception:
+                    pass
+
+                hint_now = _now_ts()
+                try:
+                    last_hint_ts = int(st_data.get("clean_thread_hint_ts") or 0)
+                except Exception:
+                    last_hint_ts = 0
+
+                if (hint_now - last_hint_ts) >= 3:
+                    try:
+                        hint_key = st_data.get("clean_thread_hint_key")
+                        hint = await event.answer(_clean_thread_hint_for_state(current_state, hint_key))
+                        asyncio.create_task(_delete_message_later(hint, 2.5))
+                    except Exception:
+                        pass
+                    try:
+                        await state.update_data(**{"clean_thread_hint_ts": hint_now})
+                    except Exception:
+                        pass
+
+                return None
+
         if not current_state:
             return await handler(event, data)
 
