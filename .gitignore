@@ -1,51 +1,34 @@
-# --- secrets ---
-.env
-env.dev
-env.prod
-*.env
+# runtime
+dump.rdb
+*.db
+*.sqlite
+*.sqlite3
 
-# --- backups / dumps ---
-backups/
-*.sql
-*.tar.gz
-
-# --- local stuff ---
-*.log
-run/
-support_bot/.env
-
-# --- secrets / env files ---
-*.local
-
-# support bot secrets
-support_bot/env.dev
-support_bot/env.prod
-
-# backups may contain secrets
-backups/*.env*
-backups/*before_env*
-backups/*before_profiles*
-backups/*before_secrets*
-backups/*supervisord.conf.before_env*
-
-# --- OS / IDE junk ---
-.DS_Store
-**/.DS_Store
-
-# --- Python junk ---
+# python
 __pycache__/
-**/__pycache__/
 *.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+.mypy_cache/
 
-# --- venv ---
-venv/
+# env
+.env
 .venv/
+venv/
 
-# --- runtime logs/pids ---
-run/*.log
-run/*.pid
-run/*.sock
+# macOS
+.DS_Store
 
+# backups
+*.bak
+*.tmp
+*.swp
 
+# archives / snapshots
+_archive/
+deploy/recovery_snapshots/
+deploy/recovery_from_images/
 
-# --- backups (may contain secrets) ---
+# logs
+*.log
