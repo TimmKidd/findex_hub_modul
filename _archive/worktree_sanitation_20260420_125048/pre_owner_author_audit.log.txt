@@ -1,6 +1,0 @@
-cc6cf6f checkpoint before alerts fix
-c1acb10 chore: remove .DS_Store from repo
-89e0e5d security: ignore secrets, caches, venv/logs; env via supervisor placeholders; docker profiles
-1d2116f chore: snapshot before alerts
-a4980b5 fix: restore working forms, employer/seeker flow and moderation (stable)
-f01b19f init

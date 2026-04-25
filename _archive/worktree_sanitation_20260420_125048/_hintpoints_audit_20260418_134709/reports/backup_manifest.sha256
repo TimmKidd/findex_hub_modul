@@ -1,9 +1,0 @@
-78f8d4cc4000d0f05dd044baca787e1415c955a7ad0973af9a072451c0f779b1  ./findex_bot/bot.py
-766b04c9495a1d8b30bafb3f6225df55174520d74d201f3f3cbf500d78c64336  ./findex_bot/handlers/employer.py
-893dba5bdd7ec9c5697a074ca42bdd33120e4c3f0cbb10216948f4b09cfdda09  ./findex_bot/handlers/forms.py
-1a4c0596aa232c93f8bffa2cb51cc9d8e504a30bc29d715f26bd86dfaf843cc5  ./findex_bot/handlers/menu.py
-0f3ca0c6285c2ab8243fcf471b212f5ea34227fda0e41aab7e2f2426de7a9c55  ./findex_bot/handlers/responds.py
-b4802b7698f384d03080853d912b7b420e89b6e398ec996370d980e8e46cc887  ./findex_bot/handlers/seeker.py
-b68c3fd2847c2f2f2b3977888a9761ae2b59b7ae33a1f619a684540cfa6553f4  ./findex_bot/handlers/start.py
-f820f10e839f700ee71ee7e1880761f7ab4c0dd5501cdb4ec0fb3b856cf75188  ./findex_bot/middlewares/fsm_watchdog.py
-38adaa5c850b05f9313c95eef46b34f4956fecb29a4f2efd53e5710a7cca3d02  ./findex_bot/utils/ui_utils.py
