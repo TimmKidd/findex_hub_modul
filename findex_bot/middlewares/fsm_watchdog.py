@@ -182,7 +182,7 @@ class FSMWatchdogMiddleware(BaseMiddleware):
 
         current_state = await state.get_state()
         st_data = await state.get_data()
-        if isinstance(event, Message):
+        if isinstance(event, Message) and os.getenv("FSM_WD_DEBUG", "0") == "1":
             try:
                 logger.warning(
                     "FSM_WD_DEBUG user_id=%s state=%r keys=%s text=%r",
