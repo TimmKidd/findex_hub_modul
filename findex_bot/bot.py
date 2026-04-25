@@ -238,6 +238,7 @@ async def _acquire_polling_guard(dp: Dispatcher):
             logging.info("✅ polling-guard: Redis lock acquired")
 
             async def _renew_loop():
+                renew_failures = 0
                 try:
                     while True:
                         await asyncio.sleep(POLLING_LOCK_RENEW_EVERY_SECONDS)
@@ -273,9 +274,19 @@ async def _acquire_polling_guard(dp: Dispatcher):
                                 return
 
                             await r.expire(POLLING_LOCK_KEY, POLLING_LOCK_TTL_SECONDS)
+                            renew_failures = 0
 
                         except Exception:
-                            logging.exception("⚠️ polling-guard: Redis renew failed. Stopping polling to avoid split-brain.")
+                            renew_failures += 1
+                            logging.exception(
+                                "⚠️ polling-guard: Redis renew failed renew_failures=%s/3",
+                                renew_failures,
+                            )
+
+                            if renew_failures < 3:
+                                continue
+
+                            logging.error("⛔ polling-guard: Redis renew failed 3 times. Stopping polling to avoid split-brain.")
                             with contextlib.suppress(Exception):
                                 await dp.stop_polling()
                             return
