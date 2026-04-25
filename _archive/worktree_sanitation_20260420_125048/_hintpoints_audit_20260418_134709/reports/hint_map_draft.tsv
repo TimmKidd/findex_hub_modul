@@ -1,0 +1,230 @@
+file	line	scope	decorators	class	hint_point_guess	text
+findex_bot/bot.py	146	_start_deeplink_entry	"deeplink_router.message(CommandStart(deep_link=True), F.text.regexp(r""^/start\s+resp_\d+\s*$""))"	hint_or_prompt	deeplink_entry_surface	⚠️ Некорректная ссылка на объявление. Открой объявление в канале и нажми «📩 Откликнуться» ещё раз.
+findex_bot/bot.py	169	_start_deeplink_entry	"deeplink_router.message(CommandStart(deep_link=True), F.text.regexp(r""^/start\s+resp_\d+\s*$""))"	button_or_label	deeplink_entry_surface	📩 Откликнуться
+findex_bot/bot.py	173	_start_deeplink_entry	"deeplink_router.message(CommandStart(deep_link=True), F.text.regexp(r""^/start\s+resp_\d+\s*$""))"	hint_or_prompt	deeplink_entry_surface	📩 Как ты хочешь откликнуться на объявление? Нажми кнопку ниже — бот продолжит отклик.
+findex_bot/handlers/employer.py	89	_trash_buttons_only_notice		hint_or_prompt	employer_other	ℹ️ Сейчас вводить текст не нужно — используй кнопки ниже.
+findex_bot/handlers/employer.py	94	_contact_mode_keyboard_2		button_or_label	employer_other	🔒 Отклики через бота (рекомендовано)
+findex_bot/handlers/employer.py	95	_contact_mode_keyboard_2		button_or_label	employer_other	📞 Контакты в объявлении (без бота)
+findex_bot/handlers/employer.py	129	_media_confirmed_stub	router.callback_query(F.data == MEDIA_CONFIRMED_CALLBACK)	hint_or_prompt	employer_other	🟢 Медиа подтверждено. Если хочешь заменить — открой предпросмотр объявления и нажми кнопку «Медиа».
+findex_bot/handlers/employer.py	188	_need_restart		hint_or_prompt	employer_other	⚠️ Сессия сбилась. Нажми /start.
+findex_bot/handlers/employer.py	216	_prompt_contacts		hint_or_prompt	vacancy_field_prompt	Укажи 📞 контакты. ℹ️ Подсказка по контактам: • Telegram: @username • Телефон: +7 999 123-45-67 • Email: name@mail.com • Любой удобный способ связи
+findex_bot/handlers/employer.py	230	_prompt_contact_mode		button_or_label	vacancy_contact_mode	Как принимать отклики?
+findex_bot/handlers/employer.py	546	emp_contacts	router.message(EmployerForm.contacts)	button_or_label	employer_other	Контакты
+findex_bot/handlers/employer.py	872	_metro_pick	router.callback_query(StateFilter(EmployerForm.location), F.data.startswith(METRO_PICK_CALLBACK))	hint_or_prompt	vacancy_location_metro_prompt	Выбери линию метро Москвы:
+findex_bot/handlers/employer.py	886	_metro_line_pick	router.callback_query(StateFilter(EmployerForm.location), F.data.startswith(METRO_LINE_CALLBACK + ':'))	hint_or_prompt	vacancy_location_metro_prompt	Выбери станцию метро:
+findex_bot/handlers/employer.py	900	_metro_station_pick	router.callback_query(StateFilter(EmployerForm.location), F.data.startswith(METRO_STATION_CALLBACK + ':'))	hint_or_prompt	employer_other	⚠️ Не удалось определить станцию
+findex_bot/handlers/employer.py	906	_metro_station_pick	router.callback_query(StateFilter(EmployerForm.location), F.data.startswith(METRO_STATION_CALLBACK + ':'))	hint_or_prompt	employer_other	⚠️ Сессия сбилась. Нажми /start.
+findex_bot/handlers/employer.py	938	_send_employer_contact_mode_hint		hint_or_prompt	vacancy_contact_mode	Нажми одну из кнопок выше, чтобы выбрать способ получения откликов.
+findex_bot/handlers/employer.py	958	_send_employer_media_choice_hint		hint_or_prompt	vacancy_media_choice_trash	Нажми одну из кнопок выше: ➕ Добавить медиа или ⏭ Без медиа.
+findex_bot/handlers/employer.py	1025	employer_buttons_only_trash	router.message(StateFilter(EmployerForm.preview, EmployerForm.media_choice, EmployerForm.media_confirm))	hint_or_prompt	vacancy_on_moderation_trash	⏳ Объявление уже отправлено на модерацию. Дождись ответа модератора.
+findex_bot/handlers/employer.py	1027	employer_buttons_only_trash	router.message(StateFilter(EmployerForm.preview, EmployerForm.media_choice, EmployerForm.media_confirm))	hint_or_prompt	vacancy_preview_trash	Используй кнопки выше: исправить поле, изменить медиа или отправить объявление на модерацию.
+findex_bot/handlers/employer.py	1029	employer_buttons_only_trash	router.message(StateFilter(EmployerForm.preview, EmployerForm.media_choice, EmployerForm.media_confirm))	hint_or_prompt	vacancy_media_choice_trash	Нажми одну из кнопок выше: ➕ Добавить медиа или ⏭ Без медиа.
+findex_bot/handlers/employer.py	1031	employer_buttons_only_trash	router.message(StateFilter(EmployerForm.preview, EmployerForm.media_choice, EmployerForm.media_confirm))	hint_or_prompt	vacancy_preview_trash	Используй кнопки выше.
+findex_bot/handlers/employer.py	1064	emp_send	"router.callback_query(F.data.startswith(""send_employer:""))"	button_or_label	employer_other	⏳ Уже на модерации
+findex_bot/handlers/employer.py	1070	emp_send	"router.callback_query(F.data.startswith(""send_employer:""))"	hint_or_prompt	employer_other	⚠️ Сначала выбери, как принимать отклики.
+findex_bot/handlers/employer.py	1141	emp_send	"router.callback_query(F.data.startswith(""send_employer:""))"	button_or_label	employer_other	✅ Отправлено на модерацию
+findex_bot/handlers/forms.py	65	_send_limit_notice		tech_note	forms_other	Один служебный лимитный message на пользователя. При повторном нажатии старый удаляем, новый отправляем и тоже автоудаляем. Никаких новых зависимостей/Redis тут не добавляем.
+findex_bot/handlers/forms.py	134	channel_ad_kb		button_or_label	forms_other	📩 Откликнуться
+findex_bot/handlers/forms.py	137	channel_ad_kb		button_or_label	forms_other	📩 Откликнуться
+findex_bot/handlers/forms.py	230	_sync_original_moderation_message_published		tech_note	forms_other	Синхронизирует оригинальную карточку модерации, если approve был нажат не на ней, а на её копии из /намодерации.
+findex_bot/handlers/forms.py	307	_sync_original_moderation_message_rejected		tech_note	forms_other	Синхронизирует оригинальную карточку модерации, если reject был нажат не на ней, а на её копии из /намодерации.
+findex_bot/handlers/forms.py	383	_delete_current_moderation_copy_if_needed		tech_note	forms_other	Если действие выполнено на копии карточки из /намодерации, удаляем эту копию после синхронизации оригинала. Если действие было на оригинальной moderation-карточке, ничего не делаем.
+findex_bot/handlers/forms.py	437	_user_publish_footer		hint_or_prompt	forms_other	ℹ️ Чтобы создать новое объявление — нажми /start
+findex_bot/handlers/forms.py	483	_strip_contacts_from_ad_text		tech_note	forms_other	Для публикации в основной канал скрываем строку с контактами, если выбран способ отклика через бота. Модерация при этом продолжает видеть полную карточку.
+findex_bot/handlers/forms.py	491	_strip_contacts_from_ad_text		button_or_label	forms_other	Контакты:
+findex_bot/handlers/forms.py	491	_strip_contacts_from_ad_text		button_or_label	forms_other	📞 Контакты:
+findex_bot/handlers/forms.py	744	_draft_preview_kb		button_or_label	vacancy_preview_actions	Изменить Контакты
+findex_bot/handlers/forms.py	753	_draft_preview_kb		button_or_label	vacancy_preview_actions	✅ Отправить на модерацию
+findex_bot/handlers/forms.py	766	_draft_preview_kb		button_or_label	vacancy_preview_actions	Изменить Контакты
+findex_bot/handlers/forms.py	775	_draft_preview_kb		button_or_label	vacancy_preview_actions	✅ Отправить на модерацию
+findex_bot/handlers/forms.py	826	toggle_published_preview	"router.callback_query(F.data.startswith(""pubpv_toggle:""))"	hint_or_prompt	published_preview_toggle_notice	❌ Не удалось обновить карточку
+findex_bot/handlers/forms.py	873	republish_from_preview	"router.callback_query(F.data.startswith(""republish:""))"	hint_or_prompt	republish_notice	❌ Не удалось создать копию
+findex_bot/handlers/forms.py	949	reject_ad	"router.callback_query(F.data.startswith(""reject:""))"	button_or_label	moderation_reject_surface	соискатель
+findex_bot/handlers/forms.py	951	reject_ad	"router.callback_query(F.data.startswith(""reject:""))"	button_or_label	moderation_reject_surface	работодатель
+findex_bot/handlers/forms.py	972	reject_ad	"router.callback_query(F.data.startswith(""reject:""))"	hint_or_prompt	moderation_reject_surface	Выбери причину отклонения
+findex_bot/handlers/forms.py	982	_field_title_local		button_or_label	forms_other	Контакты
+findex_bot/handlers/forms.py	1000	_prompt_for		hint_or_prompt	vacancy_field_prompt	Укажи 🕒 график. Пример: 5/2, 2/2, Сменный, Гибкий, Удалёнка
+findex_bot/handlers/forms.py	1007	_prompt_for		hint_or_prompt	vacancy_field_prompt	Укажи 📞 контакты. • Telegram: @username • Телефон: +7 999 123-45-67 • Email: name@mail.com • Любой удобный способ связи
+findex_bot/handlers/forms.py	1035	_prompt_for		hint_or_prompt	vacancy_field_prompt	Укажи 📞 контакты. • Telegram: @username • Телефон: +7 999 123-45-67 • Email: name@mail.com • Любой удобный способ связи
+findex_bot/handlers/forms.py	1082	_role_from_moderation_message		button_or_label	forms_other	соискатель
+findex_bot/handlers/forms.py	1085	_role_from_moderation_message		button_or_label	forms_other	работодатель
+findex_bot/handlers/forms.py	1207	rejr_dispatch	"router.callback_query(F.data.startswith(""rejr:""))"	button_or_label	moderation_reject_reason_notice	Контакты некорректные
+findex_bot/handlers/forms.py	1352	_start_edit_from_preview		hint_or_prompt	forms_other	❌ Не удалось открыть режим редактирования
+findex_bot/handlers/menu.py	66	_menu_kb		button_or_label	menu_surface	📩 Мои отклики
+findex_bot/handlers/menu.py	70	_menu_kb		button_or_label	menu_surface	📣 Канал - обязательная подписка
+findex_bot/handlers/menu.py	79	_responds_root_kb		button_or_label	menu_surface	👤 Я откликался
+findex_bot/handlers/menu.py	80	_responds_root_kb		button_or_label	menu_surface	🧑‍💼 Мне откликнулись
+findex_bot/handlers/menu.py	91	_responds_role_kb		button_or_label	menu_surface	↩️ Мои отклики
+findex_bot/handlers/menu.py	273	_render_pending_preview_surface		hint_or_prompt	menu_surface	Полноценный preview pending-объявления: - тот же текст get_ad_text(ad) - те же media (photo/video) - НО keyboard только stub «объявление уже отправлено на модерацию» + наши кнопки возврата в диагностику/меню
+findex_bot/handlers/menu.py	505	_unread_badge		button_or_label	menu_surface	🔴 Новый отклик
+findex_bot/handlers/menu.py	548	_responds_root_text		hint_or_prompt	menu_surface	📩 <b>Мои отклики</b> ⚡ Все отклики и диалоги в одном месте Следи за статусами, отвечай кандидатам и управляй общением без лишних действий Выбери раздел:
+findex_bot/handlers/menu.py	557	_responds_role_text		button_or_label	menu_surface	👤 <b>Я откликался</b>
+findex_bot/handlers/menu.py	557	_responds_role_text		button_or_label	menu_surface	🧑‍💼 <b>Мне откликнулись</b>
+findex_bot/handlers/menu.py	559	_responds_role_text		hint_or_prompt	menu_surface	📩 <b>Мои отклики</b> {...} ⚡ Управляй откликами и диалогами 🟢 Активные: <b>{...}</b> 🔴 Закрытые: <b>{...}</b> Выбери раздел:
+findex_bot/handlers/menu.py	579	_group_header_for_status		button_or_label	menu_surface	🆕 <b>Новые отклики</b>
+findex_bot/handlers/menu.py	622	_responds_bucket_text		button_or_label	menu_surface	👤 <b>Я откликался</b>
+findex_bot/handlers/menu.py	622	_responds_bucket_text		button_or_label	menu_surface	🧑‍💼 <b>Мне откликнулись</b>
+findex_bot/handlers/menu.py	626	_responds_bucket_text		button_or_label	menu_surface	📩 <b>Мои отклики</b>
+findex_bot/handlers/menu.py	628	_responds_bucket_text		button_or_label	menu_surface	⚡ Отклик → диалог → результат
+findex_bot/handlers/menu.py	638	_responds_bucket_text		hint_or_prompt	menu_surface	📩 <b>Мои отклики</b> ⚡ Отклик → диалог → результат 👤 <b>Я откликался</b> 🟢 <b>Активные</b>
+findex_bot/handlers/menu.py	643	_responds_bucket_text		hint_or_prompt	menu_surface	Пока откликов нет ⚡ Найди вакансию и откликнись Работодатель ответит прямо в диалоге Начни прямо сейчас 👇
+findex_bot/handlers/menu.py	651	_responds_bucket_text		hint_or_prompt	menu_surface	📩 <b>Мои отклики</b> ⚡ Отклик → диалог → результат 🧑‍💼 <b>Мне откликнулись</b> 🟢 <b>Активные</b>
+findex_bot/handlers/menu.py	656	_responds_bucket_text		hint_or_prompt	menu_surface	Пока откликов нет ⚡ Кандидаты появляются сразу после публикации Начни получать отклики уже сегодня Размести вакансию 👇
+findex_bot/handlers/menu.py	700	_send_or_edit_menu		hint_or_prompt	menu_surface	{...}📋 <b>FindexHub</b> ⚡ Быстрые вакансии без ожидания Отклик → диалог → результат Управляй откликами, находи кандидатов и получай ответы без ожидания Выбери действие:
+findex_bot/handlers/menu.py	781	_send_or_edit_pending_ad		button_or_label	menu_surface	⚠️ Объявление уже не находится на модерации
+findex_bot/handlers/responds.py	348	_render_thread		button_or_label	responds_other	🧑‍💼 Работодатель
+findex_bot/handlers/responds.py	407	fast_respond_offer_kb		button_or_label	responds_other	⚡ Быстрый отклик
+findex_bot/handlers/responds.py	408	fast_respond_offer_kb		button_or_label	responds_other	✏️ Заполнить заново
+findex_bot/handlers/responds.py	430	_fast_respond_offer_text		hint_or_prompt	respond_entry_surface	⚡ <b>У тебя уже есть сохранённая анкета.</b> Ты откликаешься на объявление:
+findex_bot/handlers/responds.py	436	_fast_respond_offer_text		hint_or_prompt	respond_entry_surface	Выбери действие:
+findex_bot/handlers/responds.py	444	_fast_respond_offer_text		hint_or_prompt	respond_entry_surface	Выбери действие:
+findex_bot/handlers/responds.py	520	_respond_intro_text		hint_or_prompt	respond_entry_surface	📨 <b>Отклик на вакансию</b> ⚡ Быстрый отклик — начни диалог сразу Ты откликаешься на объявление:
+findex_bot/handlers/responds.py	524	_respond_intro_text		hint_or_prompt	respond_entry_surface	Отклик займёт меньше минуты. Нажми «⚡ Откликнуться за 1 минуту», чтобы заполнить мини-анкету.
+findex_bot/handlers/responds.py	530	_respond_intro_text		hint_or_prompt	respond_entry_surface	📨 <b>Отклик на вакансию</b> ⚡ Быстрый отклик — начни диалог сразу Отклик займёт меньше минуты. Нажми «⚡ Откликнуться за 1 минуту», чтобы заполнить мини-анкету.
+findex_bot/handlers/responds.py	539	_respond_draft_choice_text		hint_or_prompt	respond_entry_surface	📝 <b>У тебя уже есть незавершённый отклик на это объявление.</b> Выбери, что сделать дальше:
+findex_bot/handlers/responds.py	832	_acquire_form_send_click_lock		tech_note	responds_other	Короткий anti-race lock именно на кнопку отправки анкеты. Нужен, чтобы не пускать повторные callback'и form_send почти одновременно.
+findex_bot/handlers/responds.py	856	_delete_form_preview_message		tech_note	responds_other	Гарантированно удаляет preview-анкету, если она ещё висит. Используется в success/duplicate ветках form_send.
+findex_bot/handlers/responds.py	886	_delete_intro_service_message		other_ui	responds_other	Удаляет intro/service-message. - если ad_id передан: удаляет только сообщение этого объявления - если ad_id не передан: удаляет все intro/service-message пользователя
+findex_bot/handlers/responds.py	1027	_send_intro_trash_hint		hint_or_prompt	respond_intro_choice_trash	👆 Нажми кнопку «⚡ Откликнуться за 1 минуту» выше.
+findex_bot/handlers/responds.py	1224	intro_kb		button_or_label	responds_other	⚡ Откликнуться за 1 минуту
+findex_bot/handlers/responds.py	1241	existing_respond_notice_kb		button_or_label	responds_other	💬 Открыть мой отклик
+findex_bot/handlers/responds.py	1251	_existing_respond_notice_text		button_or_label	responds_other	📂 <b>У тебя уже есть отклик на это объявление.</b> Вот это объявление:
+findex_bot/handlers/responds.py	1254	_existing_respond_notice_text		button_or_label	responds_other	⚡ Продолжай диалог или открой карточку отклика.
+findex_bot/handlers/responds.py	1259	_existing_respond_notice_text		hint_or_prompt	responds_other	📂 <b>У тебя уже есть отклик на это объявление.</b> ⚡ Продолжай диалог или открой карточку отклика.
+findex_bot/handlers/responds.py	1355	_resume_draft_flow		hint_or_prompt	responds_other	🧾 <b>Анкета кандидата</b> ⚡ Отклик займёт меньше минуты 1/4 Введи <b>Имя</b> (обязательно).
+findex_bot/handlers/responds.py	1383	_resume_draft_flow		hint_or_prompt	respond_citizenship_prompt	3/4 Выбери <b>Гражданство</b> (обязательно). Если твоей страны нет в списке — нажми «🌍 Другая страна».
+findex_bot/handlers/responds.py	1596	_closed_stub_btn		button_or_label	responds_other	🔒 Отклик закрыт кандидатом
+findex_bot/handlers/responds.py	1598	_closed_stub_btn		button_or_label	responds_other	🔒 Отклик закрыт работодателем
+findex_bot/handlers/responds.py	1600	_closed_stub_btn		button_or_label	responds_other	🔒 Отклик закрыт
+findex_bot/handlers/responds.py	1640	author_card_kb		button_or_label	responds_other	🚫 Закрыть отклик
+findex_bot/handlers/responds.py	1680	candidate_card_kb		button_or_label	responds_other	🚫 Отменить отклик
+findex_bot/handlers/responds.py	1685	candidate_card_kb		button_or_label	responds_other	🚫 Отменить отклик
+findex_bot/handlers/responds.py	1708	form_preview_kb		button_or_label	responds_other	📨 Отправить отклик
+findex_bot/handlers/responds.py	1722	_back_to_list_btn		button_or_label	responds_other	↩️ К списку откликов
+findex_bot/handlers/responds.py	1728	_extract_browse_context_from_markup		tech_note	responds_other	Пытаемся восстановить browse-context из текущей inline-клавиатуры карточки. Нужен для случаев, когда карточка открыта из списка откликов, а callback_data рабочей кнопки (например cancel/close) не содержит side/bucket/page.
+findex_bot/handlers/responds.py	1769	_respond_action_forbidden_text		button_or_label	responds_other	🔒 {...} недоступно. Отклик закрыт работодателем.
+findex_bot/handlers/responds.py	1771	_respond_action_forbidden_text		button_or_label	responds_other	🔒 {...} недоступно. Отклик закрыт кандидатом.
+findex_bot/handlers/responds.py	1773	_respond_action_forbidden_text		button_or_label	responds_other	🔒 {...} недоступно. Отклик закрыт системой.
+findex_bot/handlers/responds.py	1777	_respond_action_forbidden_text		button_or_label	responds_other	🔒 {...} недоступно. Отклик устарел: срок активности истёк ({...} дн.).
+findex_bot/handlers/responds.py	1793	_build_compact_text		button_or_label	responds_other	📩 Отклик <b>#{...}</b> • Объявление: <b>#{...}</b> • Ссылка: {...}
+findex_bot/handlers/responds.py	1948	_build_card_text		button_or_label	respond_active_card_surface	📩 <b>Отклик на вакансию</b>
+findex_bot/handlers/responds.py	1949	_build_card_text		button_or_label	respond_active_card_surface	Отклик: <code>#{...}</code>
+findex_bot/handlers/responds.py	1982	_build_card_text		button_or_label	respond_active_card_surface	⚡ Диалог начинается сразу после отклика
+findex_bot/handlers/responds.py	2147	toggle_card	"router.callback_query(F.data.startswith(f""{CB_TOGGLE}:""))"	button_or_label	responds_other	❌ Отклик не найден
+findex_bot/handlers/responds.py	2192	toggle_card	"router.callback_query(F.data.startswith(f""{CB_TOGGLE}:""))"	button_or_label	responds_other	❌ Отклик не найден
+findex_bot/handlers/responds.py	2234	_guard_ad_for_respond		button_or_label	responds_other	🚫 Отклик невозможен Объявление закрыто работодателем.
+findex_bot/handlers/responds.py	2236	_guard_ad_for_respond		button_or_label	responds_other	🚫 Отклик невозможен Объявление закрыто работодателем.
+findex_bot/handlers/responds.py	2241	_guard_ad_for_respond		button_or_label	responds_other	🚫 Вакансия больше не актуальна. Отклик невозможен.
+findex_bot/handlers/responds.py	2243	_guard_ad_for_respond		button_or_label	responds_other	🚫 Вакансия больше не актуальна. Отклик невозможен.
+findex_bot/handlers/responds.py	2248	_guard_ad_for_respond		button_or_label	responds_other	🚫 Это объявление устарело. Отклик невозможен.
+findex_bot/handlers/responds.py	2250	_guard_ad_for_respond		button_or_label	responds_other	🚫 Это объявление устарело. Отклик невозможен.
+findex_bot/handlers/responds.py	2269	start_from_deeplink		button_or_label	responds_other	❌ Нельзя откликнуться на собственное объявление.
+findex_bot/handlers/responds.py	2382	draft_resume	router.callback_query(F.data == CB_DRAFT_RESUME)	hint_or_prompt	responds_other	⏳ Черновик не найден. Нажми «📩 Откликнуться» на объявлении ещё раз.
+findex_bot/handlers/responds.py	2408	draft_restart	router.callback_query(F.data == CB_DRAFT_RESTART)	hint_or_prompt	responds_other	⏳ Контекст объявления потерян. Нажми «📩 Откликнуться» на объявлении ещё раз.
+findex_bot/handlers/responds.py	2477	intro_choice_clean_thread_guard	router.message(RespondFSM.form_intro_choice)	tech_note	responds_other	Clean-thread guard ТОЛЬКО для intro-card этапа. Пока пользователь не нажал кнопку «Откликнуться за 1 минуту», любые ручные сообщения считаются мусором: - удаляем сообщение - показываем короткий автоудаляемый hint
+findex_bot/handlers/responds.py	2514	saved_choice_clean_thread	router.message(RespondFSM.form_saved_choice)	hint_or_prompt	respond_saved_choice_trash	Используй кнопки в карточке выше.
+findex_bot/handlers/responds.py	2529	wait_hint	"router.callback_query(F.data.startswith(f""{CB_WAIT}:""))"	hint_or_prompt	respond_wait_status_notice	⏳ Отклик на рассмотрении. Пока работодатель не пригласит — переписка недоступна. Как только тебя пригласят, в карточке появится кнопка «Ответить».
+findex_bot/handlers/responds.py	2548	open_menu_from_respond_card	router.callback_query(F.data == CB_MENU_OPEN)	button_or_label	responds_other	Открой меню командой /menu
+findex_bot/handlers/responds.py	2575	respond_to_menu	"router.callback_query(F.data.startswith(f""{CB_MENU}:""))"	hint_or_prompt	responds_other	Ок. Контекст сохранён на 15 минут. Открой меню бота и нажми «🔙 Вернуться к отклику».
+findex_bot/handlers/responds.py	2596	respond_back	router.callback_query(F.data == CB_BACK)	hint_or_prompt	responds_other	⏳ Сессия устарела. Нажми «📩 Откликнуться» на объявлении ещё раз.
+findex_bot/handlers/responds.py	2644	resume_respond	"router.callback_query(F.data.startswith(f""{CB_RESUME}:""))"	button_or_label	responds_other	❌ Отклик не найден
+findex_bot/handlers/responds.py	2664	resume_respond	"router.callback_query(F.data.startswith(f""{CB_RESUME}:""))"	hint_or_prompt	responds_other	⚠️ Не удалось открыть отклик
+findex_bot/handlers/responds.py	2781	open_respond_from_list	"router.callback_query(F.data.startswith(f""{CB_OPEN_FROM_LIST}:""))"	button_or_label	responds_other	❌ Отклик не найден
+findex_bot/handlers/responds.py	2898	intro_continue	"router.callback_query(F.data.startswith(f""{CB_INTRO_CONTINUE}:""))"	hint_or_prompt	responds_other	🧾 <b>Анкета кандидата</b> ⚡ Отклик займёт меньше минуты 1/4 Введи <b>Имя</b> (обязательно).
+findex_bot/handlers/responds.py	2940	respond_entry	"router.callback_query(F.data.startswith(f""{CB_RESPOND}:""))"	button_or_label	responds_other	❌ Нельзя откликнуться на собственное объявление
+findex_bot/handlers/responds.py	3013	fast_respond_restart	"router.callback_query(F.data.startswith(f""{CB_FAST_RESPOND_RESTART}:""))"	hint_or_prompt	responds_other	🧾 <b>Анкета кандидата</b> ⚡ Отклик займёт меньше минуты 1/4 Введи <b>Имя</b> (обязательно).
+findex_bot/handlers/responds.py	3050	fast_respond_send	"router.callback_query(F.data.startswith(f""{CB_FAST_RESPOND}:""))"	button_or_label	responds_other	⏳ Отклик уже отправляется. Подожди пару секунд.
+findex_bot/handlers/responds.py	3068	fast_respond_send	"router.callback_query(F.data.startswith(f""{CB_FAST_RESPOND}:""))"	button_or_label	responds_other	🚫 Ты уже откликался на это объявление.
+findex_bot/handlers/responds.py	3075	fast_respond_send	"router.callback_query(F.data.startswith(f""{CB_FAST_RESPOND}:""))"	hint_or_prompt	responds_other	🚫 Лимит откликов исчерпан. Сегодня можно отправить только 5 откликов. Попробуй снова после полуночи.
+findex_bot/handlers/responds.py	3082	fast_respond_send	"router.callback_query(F.data.startswith(f""{CB_FAST_RESPOND}:""))"	hint_or_prompt	responds_other	⚠️ Временно не удалось проверить дневной лимит откликов. Попробуй ещё раз чуть позже.
+findex_bot/handlers/responds.py	3103	fast_respond_send	"router.callback_query(F.data.startswith(f""{CB_FAST_RESPOND}:""))"	button_or_label	responds_other	Отклик отправлен по сохранённой анкете.
+findex_bot/handlers/responds.py	3143	fast_respond_send	"router.callback_query(F.data.startswith(f""{CB_FAST_RESPOND}:""))"	button_or_label	responds_other	🚫 Ты уже откликался на это объявление.
+findex_bot/handlers/responds.py	3176	fast_respond_send	"router.callback_query(F.data.startswith(f""{CB_FAST_RESPOND}:""))"	button_or_label	responds_other	🚀 Быстрый отклик отправлен Работодатель уже может ответить
+findex_bot/handlers/responds.py	3195	_send_form_preview_from_state		hint_or_prompt	respond_form_context_lost	⚠️ Потерял контекст объявления. Нажми «📩 Откликнуться» ещё раз.
+findex_bot/handlers/responds.py	3243	_send_form_preview_from_state		hint_or_prompt	responds_other	✏️ Чтобы изменить конкретное поле — нажми на кнопку ниже. Если всё верно — нажми «📨 Отправить отклик».
+findex_bot/handlers/responds.py	3381	form_preview_clean_thread	router.message(RespondFSM.form_preview)	hint_or_prompt	respond_form_preview_trash	Используй кнопки выше.
+findex_bot/handlers/responds.py	3449	form_existing_notice_clean_thread	router.message(RespondFSM.form_existing_notice)	hint_or_prompt	respond_existing_notice_trash	Используй кнопку «Открыть мой отклик» в карточке выше.
+findex_bot/handlers/responds.py	3537	form_step_age	router.message(RespondFSM.form_age)	hint_or_prompt	respond_citizenship_prompt	3/4 Выбери <b>Гражданство</b> (обязательно). Если твоей страны нет в списке — нажми «🌍 Другая страна».
+findex_bot/handlers/responds.py	3573	form_step_citizenship_pick_message	router.message(RespondFSM.form_citizenship_pick)	hint_or_prompt	respond_citizenship_prompt	⚠️ Здесь нужно выбрать гражданство кнопкой выше. Если страны нет в списке — нажми «🌍 Другая страна».
+findex_bot/handlers/responds.py	3708	form_step_experience	router.message(RespondFSM.form_experience)	hint_or_prompt	respond_resume_prompt	📎 <b>Резюме</b> (опционально) Пришли: • файл резюме (doc/pdf) ИЛИ • ссылку (Avito / HH / Job.ru / SuperJob) Либо нажми «⏭️ Пропустить».
+findex_bot/handlers/responds.py	3885	form_edit_field	"router.callback_query(F.data.startswith(f""{CB_FORM_EDIT}:""))"	hint_or_prompt	respond_citizenship_prompt	3/4 Выбери <b>Гражданство</b> (обязательно). Если твоей страны нет в списке — нажми «🌍 Другая страна».
+findex_bot/handlers/responds.py	3903	form_edit_field	"router.callback_query(F.data.startswith(f""{CB_FORM_EDIT}:""))"	hint_or_prompt	respond_resume_prompt	📎 <b>Резюме</b> (опционально) Пришли: • файл резюме (doc/pdf) ИЛИ • ссылку (Avito / HH / Job.ru / SuperJob) Либо нажми «⏭️ Пропустить».
+findex_bot/handlers/responds.py	3947	form_send	"router.callback_query(F.data.startswith(f""{CB_FORM_SEND}:""))"	button_or_label	responds_other	⏳ Кнопка уже нажата. Подожди 1–2 секунды и попробуй ещё раз.
+findex_bot/handlers/responds.py	3959	form_send	"router.callback_query(F.data.startswith(f""{CB_FORM_SEND}:""))"	button_or_label	responds_other	⏳ Отклик уже отправляется. Подожди пару секунд.
+findex_bot/handlers/responds.py	3992	form_send	"router.callback_query(F.data.startswith(f""{CB_FORM_SEND}:""))"	button_or_label	responds_other	🚫 Ты уже откликался на это объявление.
+findex_bot/handlers/responds.py	3999	form_send	"router.callback_query(F.data.startswith(f""{CB_FORM_SEND}:""))"	hint_or_prompt	responds_other	🚫 Лимит откликов исчерпан. Сегодня можно отправить только 5 откликов. Попробуй снова после полуночи.
+findex_bot/handlers/responds.py	4006	form_send	"router.callback_query(F.data.startswith(f""{CB_FORM_SEND}:""))"	hint_or_prompt	responds_other	⚠️ Временно не удалось проверить дневной лимит откликов. Попробуй ещё раз чуть позже.
+findex_bot/handlers/responds.py	4016	form_send	"router.callback_query(F.data.startswith(f""{CB_FORM_SEND}:""))"	button_or_label	responds_other	Отклик отправлен. Анкета заполнена.
+findex_bot/handlers/responds.py	4066	form_send	"router.callback_query(F.data.startswith(f""{CB_FORM_SEND}:""))"	button_or_label	responds_other	🚫 Ты уже откликался на это объявление.
+findex_bot/handlers/responds.py	4120	form_send	"router.callback_query(F.data.startswith(f""{CB_FORM_SEND}:""))"	button_or_label	responds_other	🚀 Отклик отправлен Работодатель уже может ответить
+findex_bot/handlers/responds.py	4239	candidate_cancel	"router.callback_query(F.data.startswith(f""{CB_CAND_CANCEL}:""))"	button_or_label	respond_action_notice	❌ Отклик не найден
+findex_bot/handlers/responds.py	4245	candidate_cancel	"router.callback_query(F.data.startswith(f""{CB_CAND_CANCEL}:""))"	button_or_label	respond_action_notice	🔒 Отклик уже закрыт
+findex_bot/handlers/responds.py	4290	candidate_cancel	"router.callback_query(F.data.startswith(f""{CB_CAND_CANCEL}:""))"	button_or_label	respond_action_notice	🚫 Отклик закрыт
+findex_bot/handlers/responds.py	4306	author_close	"router.callback_query(F.data.startswith(f""{CB_AUTHOR_CLOSE}:"") | F.data.startswith(f""{CB_OWNER_CLOSE_ALIAS}:""))"	button_or_label	respond_action_notice	❌ Отклик не найден
+findex_bot/handlers/responds.py	4312	author_close	"router.callback_query(F.data.startswith(f""{CB_AUTHOR_CLOSE}:"") | F.data.startswith(f""{CB_OWNER_CLOSE_ALIAS}:""))"	button_or_label	respond_action_notice	🔒 Отклик уже закрыт
+findex_bot/handlers/responds.py	4339	author_close	"router.callback_query(F.data.startswith(f""{CB_AUTHOR_CLOSE}:"") | F.data.startswith(f""{CB_OWNER_CLOSE_ALIAS}:""))"	button_or_label	respond_action_notice	🚫 Отклик закрыт
+findex_bot/handlers/responds.py	4356	author_reject	"router.callback_query(F.data.startswith(f""{CB_AUTHOR_REJECT}:""))"	button_or_label	respond_action_notice	❌ Отклик не найден
+findex_bot/handlers/responds.py	4363	author_reject	"router.callback_query(F.data.startswith(f""{CB_AUTHOR_REJECT}:""))"	button_or_label	respond_action_notice	🔒 Отклик уже закрыт
+findex_bot/handlers/responds.py	4366	author_reject	"router.callback_query(F.data.startswith(f""{CB_AUTHOR_REJECT}:""))"	button_or_label	respond_action_notice	Отклик отклонён работодателем.
+findex_bot/handlers/responds.py	4409	author_reject	"router.callback_query(F.data.startswith(f""{CB_AUTHOR_REJECT}:""))"	button_or_label	respond_action_notice	🚫 Работодатель отклонил отклик.
+findex_bot/handlers/responds.py	4431	author_invite	"router.callback_query(F.data.startswith(f""{CB_AUTHOR_INVITE}:"") | F.data.startswith(f""{CB_OWNER_INVITE_ALIAS}:""))"	button_or_label	respond_action_notice	❌ Отклик не найден
+findex_bot/handlers/responds.py	4438	author_invite	"router.callback_query(F.data.startswith(f""{CB_AUTHOR_INVITE}:"") | F.data.startswith(f""{CB_OWNER_INVITE_ALIAS}:""))"	button_or_label	respond_action_notice	🔒 Отклик уже закрыт
+findex_bot/handlers/responds.py	4440	author_invite	"router.callback_query(F.data.startswith(f""{CB_AUTHOR_INVITE}:"") | F.data.startswith(f""{CB_OWNER_INVITE_ALIAS}:""))"	button_or_label	respond_action_notice	🔒 Отклик устарел и уже недоступен.
+findex_bot/handlers/responds.py	4490	author_reply_start	"router.callback_query(F.data.startswith(f""{CB_AUTHOR_REPLY}:"") | F.data.startswith(f""{CB_OWNER_REPLY_ALIAS}:""))"	button_or_label	respond_action_notice	❌ Отклик не найден
+findex_bot/handlers/responds.py	4577	author_reply_text	router.message(RespondFSM.author_reply_text)	button_or_label	respond_reply_closed_notice	🔒 Отклик уже закрыт. Сообщение не отправлено.
+findex_bot/handlers/responds.py	4621	cand_reply_start	"router.callback_query(F.data.startswith(f""{CB_CAND_REPLY}:""))"	button_or_label	respond_action_notice	❌ Отклик не найден
+findex_bot/handlers/responds.py	4714	cand_reply_text	router.message(RespondFSM.cand_reply_text)	button_or_label	respond_reply_closed_notice	🔒 Отклик уже закрыт. Сообщение не отправлено.
+findex_bot/handlers/seeker.py	90	_trash_buttons_only_notice		hint_or_prompt	vacancy_contact_mode	ℹ️ Нажми одну из кнопок выше, чтобы выбрать способ получения откликов.
+findex_bot/handlers/seeker.py	95	_contact_mode_keyboard_2		button_or_label	seeker_other	🔒 Отклики через бота (рекомендовано)
+findex_bot/handlers/seeker.py	96	_contact_mode_keyboard_2		button_or_label	seeker_other	📞 Контакты в объявлении (без бота)
+findex_bot/handlers/seeker.py	111	_media_confirmed_stub	router.callback_query(F.data == MEDIA_CONFIRMED_CALLBACK)	hint_or_prompt	seeker_other	🟢 Фото подтверждено. Если хочешь заменить — открой предпросмотр объявления и нажми кнопку «Фото».
+findex_bot/handlers/seeker.py	178	_need_restart		hint_or_prompt	seeker_other	⚠️ Сессия сбилась. Нажми /start.
+findex_bot/handlers/seeker.py	199	_prompt_schedule		hint_or_prompt	vacancy_field_prompt	Укажи 🕒 график. Пример: 5/2, 2/2, Сменный, Гибкий, Удалёнка
+findex_bot/handlers/seeker.py	212	_prompt_contacts		hint_or_prompt	vacancy_field_prompt	Укажи 📞 контакты. ℹ️ Подсказка по контактам: • Telegram: @username • Телефон: +7 999 123-45-67 • Email: name@mail.com • Любой удобный способ связи
+findex_bot/handlers/seeker.py	226	_prompt_contact_mode		button_or_label	vacancy_contact_mode	Как принимать отклики?
+findex_bot/handlers/seeker.py	558	seek_contacts	router.message(SeekerForm.contacts)	button_or_label	seeker_other	Контакты
+findex_bot/handlers/seeker.py	832	_metro_pick	router.callback_query(StateFilter(SeekerForm.location), F.data.startswith(METRO_PICK_CALLBACK))	hint_or_prompt	vacancy_location_metro_prompt	Выбери линию метро Москвы:
+findex_bot/handlers/seeker.py	846	_metro_line_pick	router.callback_query(StateFilter(SeekerForm.location), F.data.startswith(METRO_LINE_CALLBACK + ':'))	hint_or_prompt	vacancy_location_metro_prompt	Выбери станцию метро:
+findex_bot/handlers/seeker.py	860	_metro_station_pick	router.callback_query(StateFilter(SeekerForm.location), F.data.startswith(METRO_STATION_CALLBACK + ':'))	hint_or_prompt	seeker_other	⚠️ Не удалось определить станцию
+findex_bot/handlers/seeker.py	866	_metro_station_pick	router.callback_query(StateFilter(SeekerForm.location), F.data.startswith(METRO_STATION_CALLBACK + ':'))	hint_or_prompt	seeker_other	⚠️ Сессия сбилась. Нажми /start.
+findex_bot/handlers/seeker.py	898	_send_contact_mode_hint		hint_or_prompt	vacancy_contact_mode	Нажми одну из кнопок выше, чтобы выбрать способ получения откликов.
+findex_bot/handlers/seeker.py	917	_send_photo_choice_hint		hint_or_prompt	vacancy_media_choice_trash	Нажми одну из кнопок выше: ➕ Добавить медиа или ⏭ Без медиа.
+findex_bot/handlers/seeker.py	986	seeker_buttons_only_trash	router.message(StateFilter(SeekerForm.preview, SeekerForm.media_choice, SeekerForm.media_confirm))	hint_or_prompt	vacancy_on_moderation_trash	⏳ Объявление уже отправлено на модерацию. Дождись ответа модератора.
+findex_bot/handlers/seeker.py	988	seeker_buttons_only_trash	router.message(StateFilter(SeekerForm.preview, SeekerForm.media_choice, SeekerForm.media_confirm))	hint_or_prompt	vacancy_preview_trash	Используй кнопки выше: исправить поле, изменить медиа или отправить объявление на модерацию.
+findex_bot/handlers/seeker.py	990	seeker_buttons_only_trash	router.message(StateFilter(SeekerForm.preview, SeekerForm.media_choice, SeekerForm.media_confirm))	hint_or_prompt	vacancy_media_choice_trash	Нажми одну из кнопок выше: ➕ Добавить медиа или ⏭ Без медиа.
+findex_bot/handlers/seeker.py	992	seeker_buttons_only_trash	router.message(StateFilter(SeekerForm.preview, SeekerForm.media_choice, SeekerForm.media_confirm))	hint_or_prompt	vacancy_preview_trash	Используй кнопки выше.
+findex_bot/handlers/seeker.py	1027	seek_send	"router.callback_query(F.data.startswith(""send_seeker:""))"	button_or_label	seeker_other	⏳ Уже на модерации
+findex_bot/handlers/seeker.py	1033	seek_send	"router.callback_query(F.data.startswith(""send_seeker:""))"	hint_or_prompt	seeker_other	⚠️ Сначала выбери, как принимать отклики.
+findex_bot/handlers/seeker.py	1088	seek_send	"router.callback_query(F.data.startswith(""send_seeker:""))"	button_or_label	seeker_other	✅ Отправлено на модерацию
+findex_bot/handlers/start.py	24	_roles_kb		button_or_label	welcome_roles	🏢 Работодатель
+findex_bot/handlers/start.py	25	_roles_kb		button_or_label	welcome_roles	👤 Соискатель
+findex_bot/handlers/start.py	41	show_roles		tech_note	welcome_roles	"Единая функция показа выбора роли. Используется и в /start, и в кнопке ""Меню вакансий"" (vacancies_menu). ВАЖНО: - тут НЕЛЬЗЯ делать state.set_state(...) - тут НЕЛЬЗЯ создавать draft / писать ad_id Потому что draft создаётся строго в employer.py/seeker.py по нажатию кнопок роли."
+findex_bot/handlers/start.py	52	show_roles		hint_or_prompt	welcome_roles	👋 Добро пожаловать в FindexHub! Выбери роль:
+findex_bot/handlers/start.py	90	<module>		hint_or_prompt	welcome_roles_trash	Нажми одну из кнопок выше: 🏢 Работодатель или 👤 Соискатель.
+findex_bot/middlewares/fsm_watchdog.py	66	_clean_thread_hint_for_state		hint_or_prompt	vacancy_contact_mode_trash	Нажми одну из кнопок выше: 🔒 Отклики через бота или 📞 Контакты в объявлении.
+findex_bot/middlewares/fsm_watchdog.py	69	_clean_thread_hint_for_state		hint_or_prompt	vacancy_media_choice_trash	Нажми одну из кнопок выше: ➕ Добавить медиа или ⏭ Без медиа.
+findex_bot/middlewares/fsm_watchdog.py	75	_clean_thread_hint_for_state		hint_or_prompt	respond_intro_choice_trash	👆 Нажми кнопку «⚡ Откликнуться за 1 минуту» выше.
+findex_bot/middlewares/fsm_watchdog.py	78	_clean_thread_hint_for_state		hint_or_prompt	respond_saved_choice_trash	Нажми одну из кнопок выше: ⚡ Быстрый отклик или ✏️ Заполнить заново.
+findex_bot/middlewares/fsm_watchdog.py	81	_clean_thread_hint_for_state		hint_or_prompt	respond_form_preview_trash	Используй кнопки выше: измени поле или отправь отклик.
+findex_bot/middlewares/fsm_watchdog.py	84	_clean_thread_hint_for_state		hint_or_prompt	respond_citizenship_pick_trash	Здесь нужно выбрать гражданство кнопкой выше. Если страны нет в списке — нажми «🌍 Другая страна».
+findex_bot/middlewares/fsm_watchdog.py	87	_clean_thread_hint_for_state		hint_or_prompt	vacancy_media_confirm_trash	Нажми одну из кнопок выше: ✅ Подтвердить, 🔁 Заменить или 🗑 Удалить.
+findex_bot/middlewares/fsm_watchdog.py	90	_clean_thread_hint_for_state		hint_or_prompt	fsm_watchdog_fallback	Используй кнопки выше: исправить поле, изменить медиа или отправить объявление на модерацию.
+findex_bot/middlewares/fsm_watchdog.py	93	_clean_thread_hint_for_state		hint_or_prompt	fsm_watchdog_fallback	Нажми одну из кнопок выше.
+findex_bot/middlewares/fsm_watchdog.py	95	_clean_thread_hint_for_state		hint_or_prompt	fsm_watchdog_fallback	Нажми одну из кнопок выше.
+findex_bot/utils/ui_utils.py	73	contact_mode_keyboard		button_or_label	ui_utils_other	🔓 Контакты в объявлении
+findex_bot/utils/ui_utils.py	74	contact_mode_keyboard		button_or_label	ui_utils_other	🔐 Отклики через бота
+findex_bot/utils/ui_utils.py	83	contact_mode_info_text		hint_or_prompt	vacancy_contact_mode_info	🔍 <b>Разница между режимами</b> 🔓 <b>Контакты в объявлении</b> Люди пишут тебе напрямую в личку/звонят. Быстро, привычно, удобно (но это не точно) 🔐 <b>Отклики через бота</b> Все отклики приходят сюда, с кнопками “ответить / пригласить / закрыть”. Быстро, конфиденциально, безопасно, в любой момент можешь продолжить общение напрямую. Есть статусы, напоминания и защита от спама. Ты всегда можешь изменить этот выбор позже.
+findex_bot/utils/ui_utils.py	411	sent_to_moderation_stub_kb		button_or_label	vacancy_on_moderation_stub	⏳ Объявление отправлено на модерацию
+findex_bot/utils/ui_utils.py	434	field_title		button_or_label	ui_utils_other	Контакты
+findex_bot/utils/ui_utils.py	446	rejected_user_text		hint_or_prompt	moderation_rejected_user_notice	❌ Объявление отклонено модератором. Причина: <b>{...}</b> Нажми кнопку ниже, чтобы сразу исправить.
+findex_bot/utils/ui_utils.py	456	employer_media_choice_kb		button_or_label	ui_utils_other	⏭ Без медиа
+findex_bot/utils/ui_utils.py	465	seeker_media_choice_kb		button_or_label	ui_utils_other	⏭ Без медиа
+findex_bot/utils/ui_utils.py	474	media_confirm_kb		button_or_label	ui_utils_other	✅ Подтвердить
+findex_bot/utils/ui_utils.py	475	media_confirm_kb		button_or_label	ui_utils_other	🔁 Заменить
+findex_bot/utils/ui_utils.py	476	media_confirm_kb		button_or_label	ui_utils_other	🗑 Удалить
+findex_bot/utils/ui_utils.py	491	employer_preview_keyboard		button_or_label	vacancy_preview_actions	📞 Исправить контакты
+findex_bot/utils/ui_utils.py	500	employer_preview_keyboard		button_or_label	vacancy_preview_actions	✅ Отправить на модерацию
+findex_bot/utils/ui_utils.py	518	seeker_preview_keyboard		button_or_label	vacancy_preview_actions	📞 Исправить контакты
+findex_bot/utils/ui_utils.py	525	seeker_preview_keyboard		button_or_label	vacancy_preview_actions	✅ Отправить на модерацию
+findex_bot/utils/ui_utils.py	557	rejection_reasons_kb		button_or_label	ui_utils_other	📞 Контакты некорректные
+findex_bot/utils/ui_utils.py	568	rejection_reasons_kb		button_or_label	ui_utils_other	📞 Контакты некорректные

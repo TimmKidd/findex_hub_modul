@@ -12,6 +12,7 @@ import findex_bot.runtime as runtime
 from findex_bot.db.db import get_sessionmaker
 from findex_bot.db.repo import AdRepo
 from findex_bot.utils.ui_utils import safe_answer, rejection_reasons_kb, rejected_user_text, field_title
+from findex_bot.utils.obs import log_event
 
 logger = logging.getLogger(__name__)
 router = Router()
@@ -40,7 +41,7 @@ def _reason_text(role: str, field_key: str) -> str:
             "salary": "Зарплата некорректная",
             "location": "Локация некорректная",
             "contacts": "Контакты некорректные",
-            "about": "О себе заполнено некорректно",
+            "about": "О себе некорректно",
             "media": "Фото некорректное",
         }
         return mapping.get(field_key, "Заполнено некорректно")
@@ -56,19 +57,27 @@ def _reason_text(role: str, field_key: str) -> str:
     return mapping.get(field_key, "Заполнено некорректно")
 
 
-def _build_rejected_line(reason: str) -> str:
-    return f"\n\n✖ Отклонено: причина — {reason}"
+def _moderator_label(cb: CallbackQuery) -> str:
+    u = cb.from_user
+    if getattr(u, "username", None):
+        return f"@{u.username}"
+    full = " ".join([x for x in [getattr(u, "first_name", None), getattr(u, "last_name", None)] if x]) or ""
+    return full or str(getattr(u, "id", "—"))
+
+
+def _build_rejected_line(cb: CallbackQuery, reason: str) -> str:
+    return f"\n\n❌ Отклонено\nМодератор: {_moderator_label(cb)}\nПричина: {reason}"
 
 
 def _strip_previous_rejected_line(text: str) -> str:
     if not text:
         return text
-    marker = "\n\n✖ Отклонено: причина —"
-    if marker in text:
-        text = text.split(marker)[0]
-    marker2 = "\n\n❌ Отклонено"
-    if marker2 in text:
-        text = text.split(marker2)[0]
+    marker_legacy = "\n\n✖ Отклонено: причина —"
+    if marker_legacy in text:
+        text = text.split(marker_legacy)[0]
+    marker_new = "\n\n❌ Отклонено"
+    if marker_new in text:
+        text = text.split(marker_new)[0]
     return text
 
 
@@ -84,10 +93,10 @@ async def _edit_mod_message_keep_header(cb: CallbackQuery, reason: str) -> None:
     try:
         if cb.message.caption is not None:
             base = _strip_previous_rejected_line(cb.message.caption)
-            await cb.message.edit_caption(caption=base + _build_rejected_line(reason), reply_markup=None)
+            await cb.message.edit_caption(caption=base + _build_rejected_line(cb, reason), reply_markup=None)
         else:
             base = _strip_previous_rejected_line(cb.message.text or "")
-            await cb.message.edit_text(base + _build_rejected_line(reason), reply_markup=None)
+            await cb.message.edit_text(base + _build_rejected_line(cb, reason), reply_markup=None)
     except Exception:
         pass
 
@@ -133,7 +142,7 @@ def _user_fix_keyboard_for_field(field_key: str, fix_callback_data: str) -> Inli
 # -----------------------------
 # MOD: reject -> show reasons
 # -----------------------------
-@router.callback_query(F.data.startswith("reject:"))
+@router.callback_query(F.data.startswith("mod_reject:"))
 async def mod_reject(cb: CallbackQuery):
     # важно: тут НЕ показываем alert “Отклонено”, только открываем выбор причин
     await safe_answer(cb)
@@ -142,9 +151,27 @@ async def mod_reject(cb: CallbackQuery):
     async with get_sessionmaker()() as session:
         ad = await AdRepo(session).get(ad_id)
         if not ad:
+            log_event(
+                logger,
+                "moderation_reject_open",
+                moderator_user_id=cb.from_user.id,
+                callback_data=cb.data,
+                ad_id=ad_id,
+                result="not_found",
+            )
             return await safe_answer(cb, "❌ Не найдено", alert=True)
 
         role = (ad.payload or {}).get("role") or getattr(ad, "role", None) or "employer"
+
+    log_event(
+        logger,
+        "moderation_reject_open",
+        moderator_user_id=cb.from_user.id,
+        callback_data=cb.data,
+        ad_id=ad_id,
+        role=role,
+        result="ok",
+    )
 
     if cb.message:
         try:
@@ -158,12 +185,19 @@ async def mod_reject(cb: CallbackQuery):
 # MOD: select reason
 # rejr:<ad_id>:<field_key>
 # -----------------------------
-@router.callback_query(F.data.startswith("rejr:"))
+@router.callback_query(F.data.startswith("mod_rejr:"))
 async def mod_reject_reason(cb: CallbackQuery):
     await safe_answer(cb)
 
     parts = (cb.data or "").split(":")
     if len(parts) < 3:
+        log_event(
+            logger,
+            "moderation_reject_reason",
+            moderator_user_id=cb.from_user.id,
+            callback_data=cb.data,
+            result="fail",
+        )
         return
 
     ad_id = int(parts[1])
@@ -173,12 +207,32 @@ async def mod_reject_reason(cb: CallbackQuery):
         repo = AdRepo(session)
         ad = await repo.get(ad_id)
         if not ad:
+            log_event(
+                logger,
+                "moderation_reject_reason",
+                moderator_user_id=cb.from_user.id,
+                callback_data=cb.data,
+                ad_id=ad_id,
+                field_key=field_key,
+                result="not_found",
+            )
             return await safe_answer(cb, "❌ Не найдено", alert=True)
 
         payload = ad.payload or {}
         role = (payload.get("role") or getattr(ad, "role", None) or "employer").strip().lower()
 
         reason = _reason_text(role, field_key)
+
+        log_event(
+            logger,
+            "moderation_reject_reason",
+            moderator_user_id=cb.from_user.id,
+            callback_data=cb.data,
+            ad_id=ad_id,
+            field_key=field_key,
+            role=role,
+            result="ok",
+        )
 
         # 1) сохраняем причину
         await repo.patch_payload(ad_id, rejection_field=field_key, rejection_reason=reason)
@@ -195,6 +249,14 @@ async def mod_reject_reason(cb: CallbackQuery):
         # 4) сообщение пользователю + кнопка точечного исправления (как на скрине)
         author_id = payload.get("author_id") or getattr(ad, "author_id", None)
         if not author_id:
+            log_event(
+                logger,
+                "moderation_reject_notify",
+                moderator_user_id=cb.from_user.id,
+                ad_id=ad_id,
+                field_key=field_key,
+                result="fail",
+            )
             return await safe_answer(cb, "Отклонено", alert=True)
 
         fix_cb = _fix_callback(role, field_key, ad_id)
@@ -202,12 +264,39 @@ async def mod_reject_reason(cb: CallbackQuery):
             return await safe_answer(cb, "Отклонено", alert=True)
 
         try:
-            await cb.bot.send_message(
+            msg = await cb.bot.send_message(
                 int(author_id),
                 rejected_user_text(reason),
                 reply_markup=_user_fix_keyboard_for_field(field_key, fix_cb),
             )
+
+            await repo.patch_payload(
+                ad_id,
+                reject_notice_chat_id=int(msg.chat.id),
+                reject_notice_message_id=int(msg.message_id),
+                rejected_field=str(field_key),
+                rejected_reason=str(reason),
+            )
+
+            log_event(
+                logger,
+                "moderation_reject_notify",
+                moderator_user_id=cb.from_user.id,
+                author_id=author_id,
+                ad_id=ad_id,
+                field_key=field_key,
+                result="ok",
+            )
         except Exception:
+            log_event(
+                logger,
+                "moderation_reject_notify",
+                moderator_user_id=cb.from_user.id,
+                author_id=author_id,
+                ad_id=ad_id,
+                field_key=field_key,
+                result="fail",
+            )
             pass
 
     return await safe_answer(cb, "Отклонено", alert=True)

@@ -1,0 +1,62 @@
+services:
+  postgres:
+    image: postgres:16
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB}
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    command: sh -c "redis-server --appendonly yes --requirepass ${REDIS_PASSWORD}"
+
+  bot:
+    build:
+      context: /Users/tmkd/Desktop/tmkd/FindexHub
+      dockerfile: Dockerfile
+    env_file:
+      - ${APP_ENV_FILE}
+    command: python -m findex_bot.bot
+    depends_on:
+      - postgres
+      - redis
+
+  jobs:
+    build:
+      context: /Users/tmkd/Desktop/tmkd/FindexHub
+      dockerfile: Dockerfile
+    env_file:
+      - ${APP_ENV_FILE}
+    command: python -m findex_bot.jobs
+    depends_on:
+      - postgres
+      - redis
+
+  resurrection:
+    build:
+      context: /Users/tmkd/Desktop/tmkd/FindexHub
+      dockerfile: Dockerfile
+    env_file:
+      - ${APP_ENV_FILE}
+    command: python -m findex_bot.resurrection_worker
+    depends_on:
+      - postgres
+      - redis
+
+  support:
+    build:
+      context: /Users/tmkd/Desktop/tmkd/FindexHub
+      dockerfile: Dockerfile
+    env_file:
+      - ${APP_ENV_FILE}
+    command: python support_bot/support_bot.py
+    depends_on:
+      - postgres
+      - redis
+
+volumes:
+  postgres_data:

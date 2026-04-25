@@ -1,0 +1,1049 @@
+# findex_bot/handlers/seeker.py
+from __future__ import annotations
+
+import logging
+import os
+from typing import Optional, Any
+
+from aiogram import Router, F
+from aiogram.filters import StateFilter
+from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
+from aiogram.fsm.context import FSMContext
+from aiogram.enums import ParseMode
+
+import findex_bot.runtime as runtime
+from findex_bot.db.db import get_sessionmaker
+from findex_bot.db.repo import AdRepo
+from findex_bot.db.daily_limits import get_count as db_get_pub_count
+from findex_bot.states.vacancies import SeekerForm
+from findex_bot.utils.vacancy_utils import get_ad_text
+from findex_bot.utils.validators import (
+    validate_required,
+    validate_description,
+    validate_salary,
+    validate_location_letters_only,
+    validate_contacts,
+    validate_no_profanity,
+    normalize_title,
+    normalize_sentence,
+)
+from findex_bot.utils.ui_utils import (
+    safe_answer,
+    send_saved_hint,
+    moderation_keyboard,
+    seeker_media_choice_kb,
+    media_confirm_kb,
+    media_confirmed_stub_kb,
+    MEDIA_CONFIRMED_CALLBACK,
+    sent_to_moderation_stub_kb,
+    NOOP_CALLBACK,
+    DAILY_FREE_LIMIT,
+    is_unlimited,
+    utc_seconds_to_reset,
+    format_hhmmss,
+    contact_mode_info_text,
+    CB_CONTACT_MODE_SET,
+    CB_CONTACT_MODE_INFO,
+    CONTACT_MODE_CONTACTS,
+    CONTACT_MODE_BOT,
+    CONTACT_MODE_BOTH,
+    seeker_preview_keyboard,
+    track_cleanup_message,
+    track_cleanup_messages,
+    cleanup_tracked_messages,
+    reset_cleanup_bucket,
+    replace_step_prompt,
+    replace_step_error,
+    clear_step_error,
+    clear_step_prompt,
+    delete_user_input_message,
+)
+from findex_bot.utils.moscow_metro import (
+    METRO_PICK_CALLBACK,
+    METRO_LINE_CALLBACK,
+    METRO_STATION_CALLBACK,
+    METRO_CLOSE_CALLBACK,
+    metro_location_prompt,
+    metro_location_keyboard,
+    metro_lines_keyboard,
+    metro_stations_keyboard,
+    resolve_station,
+    build_moscow_location,
+    validate_location_input,
+    normalize_location_input,
+)
+
+logger = logging.getLogger(__name__)
+router = Router()
+
+K_PENDING_MEDIA = "pending_media"
+K_EDIT_MODE = "edit_mode"
+K_PREVIEW_MSG_ID = "preview_msg_id"
+K_PREVIEW_IS_MEDIA = "preview_is_media"
+
+SEEKER_MAX_VIDEO_SECONDS = 15
+SEEKER_MAX_VIDEO_SIZE_BYTES = 5 * 1024 * 1024  # 5 MB
+
+
+
+def _trash_buttons_only_notice() -> str:
+    return "ℹ️ Нажми одну из кнопок выше, чтобы выбрать способ получения откликов."
+
+def _contact_mode_keyboard_2(ad_id: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="🔒 Отклики через бота (рекомендовано)", callback_data=f"{CB_CONTACT_MODE_SET}:{int(ad_id)}:{CONTACT_MODE_BOT}")],
+            [InlineKeyboardButton(text="📞 Контакты в объявлении (без бота)", callback_data=f"{CB_CONTACT_MODE_SET}:{int(ad_id)}:{CONTACT_MODE_CONTACTS}")],
+            [InlineKeyboardButton(text="ℹ️ Что это значит?", callback_data=f"{CB_CONTACT_MODE_INFO}:{int(ad_id)}")],
+        ]
+    )
+
+
+@router.callback_query(F.data == NOOP_CALLBACK)
+async def _noop(cb: CallbackQuery):
+    await safe_answer(cb)
+
+
+@router.callback_query(F.data == MEDIA_CONFIRMED_CALLBACK)
+async def _media_confirmed_stub(cb: CallbackQuery):
+    await safe_answer(
+        cb,
+        "🟢 Фото подтверждено.\n\nЕсли хочешь заменить — открой предпросмотр объявления и нажми кнопку «Фото».",
+        alert=True,
+    )
+
+
+def _parse_id(cbdata: str) -> int:
+    return int((cbdata or "").split(":")[1])
+
+
+def _get_moderation_chat_id() -> int:
+    val = getattr(runtime, "MODERATION_CHAT_ID", None)
+    if val:
+        return int(val)
+
+    cfg = getattr(runtime, "CONFIG", None)
+    if cfg is not None and getattr(cfg, "moderation_chat_id", 0):
+        return int(cfg.moderation_chat_id)
+
+    envv = os.getenv("MODERATION_CHAT_ID")
+    if envv:
+        return int(envv)
+
+    raise RuntimeError("MODERATION_CHAT_ID is not configured")
+
+
+def _get_thread_vacancies() -> int:
+    val = getattr(runtime, "THREAD_VACANCIES", None)
+    try:
+        v = int(val or 0)
+    except Exception:
+        v = 0
+    if v:
+        return v
+
+    envv = os.getenv("THREAD_VACANCIES")
+    try:
+        return int(envv or 0)
+    except Exception:
+        return 0
+
+
+def _moderation_user_footer(cb: CallbackQuery) -> str:
+    u = cb.from_user
+    uname = f"@{u.username}" if u.username else "—"
+    full = " ".join([x for x in [u.first_name, u.last_name] if x]) or "—"
+    return (
+        "\n\n"
+        f"Автор: {uname}\n"
+        f"Telegram ID: <code>{u.id}</code>\n"
+        f"Имя: {full}"
+    )
+
+
+async def _get_ad_id(state: FSMContext) -> Optional[int]:
+    data = await state.get_data()
+    ad_id = data.get("ad_id")
+    try:
+        return int(ad_id) if ad_id is not None else None
+    except Exception:
+        return None
+
+
+def _is_edit_mode(data: dict) -> bool:
+    return bool(data.get(K_EDIT_MODE))
+
+
+async def _need_restart(message_or_cb: Message | CallbackQuery) -> None:
+    text = "⚠️ Сессия сбилась. Нажми /start."
+    try:
+        if isinstance(message_or_cb, Message):
+            msg = await message_or_cb.answer(text)
+        else:
+            await safe_answer(message_or_cb, text, alert=True)
+            if message_or_cb.message:
+                msg = await message_or_cb.message.answer(text)
+            else:
+                msg = await message_or_cb.bot.send_message(message_or_cb.from_user.id, text)
+
+        _ = msg
+    except Exception:
+        pass
+
+
+def _prompt_title() -> str:
+    return "Укажи 👤 должность.\n\nПример: Бариста, Официант, Администратор"
+
+
+def _prompt_schedule() -> str:
+    return "Укажи 🕒 график.\n\nПример: 5/2, 2/2, Сменный, Гибкий, Удалёнка"
+
+
+def _prompt_salary() -> str:
+    return "Укажи 💲 зарплатные ожидания.\n\nПример: от 80 000, 120 000, по договорённости"
+
+
+def _prompt_location() -> str:
+    return metro_location_prompt()
+
+
+def _prompt_contacts() -> str:
+    return (
+        "Укажи 📞 контакты.\n\n"
+        "ℹ️ Подсказка по контактам:\n"
+        "• Telegram: @username\n"
+        "• Телефон: +7 999 123-45-67\n"
+        "• Email: name@mail.com\n"
+        "• Любой удобный способ связи"
+    )
+
+
+def _prompt_about() -> str:
+    return "Укажи 📝 о себе.\n\nПример: опыт, навыки, чем полезен, условия (до 2000 символов)"
+
+
+def _prompt_contact_mode() -> str:
+    return "Как принимать отклики?"
+
+
+async def _published_today(user_id: int) -> int:
+    try:
+        async with get_sessionmaker()() as session:
+            v = await db_get_pub_count(session, int(user_id))
+            await session.commit()
+            return int(v)
+    except Exception:
+        return 0
+
+
+def _limit_block_text(published: int) -> str:
+    left = format_hhmmss(utc_seconds_to_reset())
+    return (
+        f"⛔ Дневной лимит публикаций исчерпан ({published}/{DAILY_FREE_LIMIT}).\n"
+        f"До сброса (UTC): {left}"
+    )
+
+
+def _sanitize_moderation_text(text: str) -> str:
+    if not text:
+        return text
+    bad_markers = ("⛔ Дневной лимит публикаций исчерпан", "До сброса (UTC):")
+    lines = (text or "").splitlines()
+    cleaned: list[str] = []
+    for ln in lines:
+        if any(m in ln for m in bad_markers):
+            continue
+        cleaned.append(ln)
+    out = "\n".join(cleaned).strip()
+    return out if out else text
+
+
+async def _cleanup_after_preview(
+    bot,
+    state: FSMContext,
+    preview_msg_id: int | None,
+    previous_preview_msg_id: int | None = None,
+) -> None:
+    keep_ids = set()
+
+    try:
+        if preview_msg_id:
+            keep_ids.add(int(preview_msg_id))
+    except Exception:
+        pass
+
+    try:
+        if previous_preview_msg_id:
+            keep_ids.add(int(previous_preview_msg_id))
+    except Exception:
+        pass
+
+    await cleanup_tracked_messages(bot, state, keep_ids=keep_ids)
+
+
+async def _upsert_preview(bot, chat_id: int, state: FSMContext, ad_id: int) -> None:
+    data = await state.get_data()
+    prev_msg_id = data.get(K_PREVIEW_MSG_ID)
+    prev_is_media = bool(data.get(K_PREVIEW_IS_MEDIA))
+
+    async with get_sessionmaker()() as session:
+        ad = await AdRepo(session).get(ad_id)
+        if not ad:
+            return
+        payload = ad.payload or {}
+        text = get_ad_text(ad)
+        photo_id = payload.get("photo_file_id")
+        video_id = payload.get("video_file_id")
+
+    has_media = bool(photo_id or video_id)
+
+    try:
+        if prev_msg_id:
+            if has_media:
+                if prev_is_media:
+                    await bot.edit_message_caption(
+                        chat_id=chat_id,
+                        message_id=int(prev_msg_id),
+                        caption=text,
+                        reply_markup=seeker_preview_keyboard(ad_id),
+                    )
+                    await state.update_data(**{K_PREVIEW_IS_MEDIA: True})
+                    await _cleanup_after_preview(bot, state, int(prev_msg_id))
+                    return
+                try:
+                    await bot.delete_message(chat_id=chat_id, message_id=int(prev_msg_id))
+                except Exception:
+                    pass
+            else:
+                if not prev_is_media:
+                    await bot.edit_message_text(
+                        chat_id=chat_id,
+                        message_id=int(prev_msg_id),
+                        text=text,
+                        reply_markup=seeker_preview_keyboard(ad_id),
+                    )
+                    await state.update_data(**{K_PREVIEW_IS_MEDIA: False})
+                    await _cleanup_after_preview(bot, state, int(prev_msg_id))
+                    return
+                try:
+                    await bot.delete_message(chat_id=chat_id, message_id=int(prev_msg_id))
+                except Exception:
+                    pass
+
+        if has_media:
+            if video_id:
+                msg = await bot.send_video(chat_id=chat_id, video=video_id, caption=text, reply_markup=seeker_preview_keyboard(ad_id))
+            else:
+                msg = await bot.send_photo(chat_id=chat_id, photo=photo_id, caption=text, reply_markup=seeker_preview_keyboard(ad_id))
+            await state.update_data(**{K_PREVIEW_MSG_ID: msg.message_id, K_PREVIEW_IS_MEDIA: True})
+            await _cleanup_after_preview(bot, state, int(msg.message_id))
+        else:
+            msg = await bot.send_message(chat_id=chat_id, text=text, reply_markup=seeker_preview_keyboard(ad_id))
+            await state.update_data(**{K_PREVIEW_MSG_ID: msg.message_id, K_PREVIEW_IS_MEDIA: False})
+            await _cleanup_after_preview(bot, state, int(msg.message_id))
+    except Exception:
+        pass
+
+
+async def _send_fresh_preview(bot, chat_id: int, state: FSMContext, ad_id: int) -> None:
+    data = await state.get_data()
+    old_msg_id = data.get(K_PREVIEW_MSG_ID)
+
+    if old_msg_id:
+        try:
+            await bot.delete_message(chat_id=chat_id, message_id=int(old_msg_id))
+        except Exception:
+            pass
+
+    async with get_sessionmaker()() as session:
+        ad = await AdRepo(session).get(ad_id)
+        if not ad:
+            return
+        payload = ad.payload or {}
+        text = get_ad_text(ad)
+        photo_id = payload.get("photo_file_id")
+        video_id = payload.get("video_file_id")
+
+    try:
+        if video_id:
+            msg = await bot.send_video(chat_id=chat_id, video=video_id, caption=text, reply_markup=seeker_preview_keyboard(ad_id))
+            await state.update_data(**{K_PREVIEW_MSG_ID: msg.message_id, K_PREVIEW_IS_MEDIA: True})
+            await _cleanup_after_preview(bot, state, int(msg.message_id))
+        elif photo_id:
+            msg = await bot.send_photo(chat_id=chat_id, photo=photo_id, caption=text, reply_markup=seeker_preview_keyboard(ad_id))
+            await state.update_data(**{K_PREVIEW_MSG_ID: msg.message_id, K_PREVIEW_IS_MEDIA: True})
+            await _cleanup_after_preview(bot, state, int(msg.message_id))
+        else:
+            msg = await bot.send_message(chat_id=chat_id, text=text, reply_markup=seeker_preview_keyboard(ad_id))
+            await state.update_data(**{K_PREVIEW_MSG_ID: msg.message_id, K_PREVIEW_IS_MEDIA: False})
+            await _cleanup_after_preview(bot, state, int(msg.message_id))
+    except Exception:
+        pass
+
+
+async def _after_field_saved(message: Message, state: FSMContext, ad_id: int, next_state, next_prompt: str, reply_markup=None) -> None:
+    data = await state.get_data()
+
+    await clear_step_error(message.bot, state, chat_id=int(message.chat.id))
+
+    if _is_edit_mode(data):
+        await state.update_data(**{K_EDIT_MODE: False, K_PENDING_MEDIA: None})
+        await state.set_state(SeekerForm.preview)
+        await _send_fresh_preview(message.bot, message.chat.id, state, ad_id)
+        return
+
+    await state.set_state(next_state)
+    await replace_step_prompt(
+        message.bot,
+        state,
+        chat_id=int(message.chat.id),
+        text=next_prompt,
+        reply_markup=reply_markup,
+    )
+
+
+@router.callback_query(F.data == "vac_seeker")
+async def seeker_entry(cb: CallbackQuery, state: FSMContext):
+    await safe_answer(cb)
+    await state.clear()
+    await reset_cleanup_bucket(state)
+
+    async with get_sessionmaker()() as session:
+        repo = AdRepo(session)
+        ad = await repo.get_or_create_draft(author_user_id=cb.from_user.id, role="seeker")
+        await repo.patch_payload(ad.id, role="seeker", author_id=cb.from_user.id, contact_mode=None)
+
+    await state.update_data(ad_id=ad.id, preview_msg_id=None, preview_is_media=False, edit_mode=False)
+    await state.set_state(SeekerForm.title)
+
+    await replace_step_prompt(
+        cb.bot,
+        state,
+        chat_id=int(cb.from_user.id),
+        text=_prompt_title(),
+    )
+
+
+@router.message(SeekerForm.title)
+async def seek_title(message: Message, state: FSMContext):
+    ad_id = await _get_ad_id(state)
+    if not ad_id:
+        await _need_restart(message)
+        return
+
+    await track_cleanup_message(state, message)
+
+    val = (message.text or "").strip()
+    err = validate_required(val, "Должность") or validate_no_profanity(val)
+    if err:
+        await replace_step_error(
+            message.bot,
+            state,
+            chat_id=int(message.chat.id),
+            text=err,
+        )
+        return
+
+    val = normalize_title(val)
+    async with get_sessionmaker()() as session:
+        await AdRepo(session).patch_payload(ad_id, title=val)
+
+    await _after_field_saved(message, state, ad_id, SeekerForm.schedule, _prompt_schedule())
+
+
+@router.message(SeekerForm.schedule)
+async def seek_schedule(message: Message, state: FSMContext):
+    ad_id = await _get_ad_id(state)
+    if not ad_id:
+        await _need_restart(message)
+        return
+
+    await track_cleanup_message(state, message)
+
+    val = (message.text or "").strip()
+    err = validate_required(val, "График") or validate_no_profanity(val)
+    if err:
+        await replace_step_error(
+            message.bot,
+            state,
+            chat_id=int(message.chat.id),
+            text=err,
+        )
+        return
+
+    async with get_sessionmaker()() as session:
+        await AdRepo(session).patch_payload(ad_id, schedule=val)
+
+    await _after_field_saved(message, state, ad_id, SeekerForm.salary, _prompt_salary())
+
+
+@router.message(SeekerForm.salary)
+async def seek_salary(message: Message, state: FSMContext):
+    ad_id = await _get_ad_id(state)
+    if not ad_id:
+        await _need_restart(message)
+        return
+
+    await track_cleanup_message(state, message)
+
+    val = (message.text or "").strip()
+    err = validate_required(val, "Зарплата") or validate_no_profanity(val) or validate_salary(val)
+    if err:
+        await replace_step_error(
+            message.bot,
+            state,
+            chat_id=int(message.chat.id),
+            text=err,
+        )
+        return
+
+    async with get_sessionmaker()() as session:
+        await AdRepo(session).patch_payload(ad_id, salary=val)
+
+    await _after_field_saved(message, state, ad_id, SeekerForm.location, _prompt_location(), reply_markup=metro_location_keyboard())
+
+
+@router.message(SeekerForm.location)
+async def seek_location(message: Message, state: FSMContext):
+    ad_id = await _get_ad_id(state)
+    if not ad_id:
+        await _need_restart(message)
+        return
+
+    await track_cleanup_message(state, message)
+
+    val = (message.text or "").strip()
+    err = validate_required(val, "Локация") or validate_no_profanity(val) or validate_location_input(val)
+    if err:
+        await replace_step_error(
+            message.bot,
+            state,
+            chat_id=int(message.chat.id),
+            text=err,
+        )
+        return
+
+    val = normalize_location_input(val)
+    async with get_sessionmaker()() as session:
+        await AdRepo(session).patch_payload(ad_id, location=val)
+
+    await _after_field_saved(message, state, ad_id, SeekerForm.contacts, _prompt_contacts())
+
+
+@router.message(SeekerForm.contacts)
+async def seek_contacts(message: Message, state: FSMContext):
+    ad_id = await _get_ad_id(state)
+    if not ad_id:
+        await _need_restart(message)
+        return
+
+    await track_cleanup_message(state, message)
+
+    val = (message.text or "").strip()
+    err = validate_required(val, "Контакты") or validate_no_profanity(val) or validate_contacts(val)
+    if err:
+        await replace_step_error(
+            message.bot,
+            state,
+            chat_id=int(message.chat.id),
+            text=err,
+        )
+        return
+
+    async with get_sessionmaker()() as session:
+        await AdRepo(session).patch_payload(ad_id, contacts=val)
+
+    await _after_field_saved(message, state, ad_id, SeekerForm.description, _prompt_about())
+
+
+@router.message(SeekerForm.description)
+async def seek_about(message: Message, state: FSMContext):
+    ad_id = await _get_ad_id(state)
+    if not ad_id:
+        await _need_restart(message)
+        return
+
+    await track_cleanup_message(state, message)
+
+    val = (message.text or "").strip()
+    err = validate_required(val, "О себе") or validate_no_profanity(val) or validate_description(val)
+    if err:
+        await replace_step_error(
+            message.bot,
+            state,
+            chat_id=int(message.chat.id),
+            text=err,
+        )
+        return
+
+    val = normalize_sentence(val)
+
+    async with get_sessionmaker()() as session:
+        await AdRepo(session).patch_payload(
+            ad_id,
+            description=val,
+            about=val,
+            role="seeker",
+            ad_role="seeker",
+        )
+
+    data = await state.get_data()
+    if _is_edit_mode(data):
+        await clear_step_error(message.bot, state, chat_id=int(message.chat.id))
+        await clear_step_prompt(message.bot, state, chat_id=int(message.chat.id))
+        await state.update_data(**{K_EDIT_MODE: False, K_PENDING_MEDIA: None})
+        await state.set_state(SeekerForm.preview)
+        await _send_fresh_preview(message.bot, message.chat.id, state, ad_id)
+        return
+
+    sent = await message.answer(_prompt_contact_mode(), reply_markup=_contact_mode_keyboard_2(ad_id))
+    await track_cleanup_message(state, sent)
+    await state.set_state(SeekerForm.media_choice)
+
+
+@router.callback_query(
+    StateFilter(SeekerForm.media_choice),
+    F.data.startswith(f"{CB_CONTACT_MODE_INFO}:")
+)
+async def seek_contact_mode_info(cb: CallbackQuery, state: FSMContext):
+    await safe_answer(cb)
+    data = await state.get_data()
+    ad_id = int(data.get("ad_id") or 0)
+    if not ad_id:
+        return
+    try:
+        if cb.message:
+            info_msg = await cb.message.answer(contact_mode_info_text(), parse_mode=ParseMode.HTML)
+            prompt_msg = await cb.message.answer(_prompt_contact_mode(), reply_markup=_contact_mode_keyboard_2(ad_id))
+            await track_cleanup_messages(state, info_msg, prompt_msg)
+    except Exception:
+        pass
+
+
+@router.callback_query(
+    StateFilter(SeekerForm.media_choice),
+    F.data.startswith(f"{CB_CONTACT_MODE_SET}:")
+)
+async def seek_contact_mode_set(cb: CallbackQuery, state: FSMContext):
+    await safe_answer(cb)
+    parts = (cb.data or "").split(":")
+    if len(parts) != 3:
+        return await safe_answer(cb, "⚠️ Некорректные данные", alert=True)
+
+    try:
+        ad_id = int(parts[1])
+    except Exception:
+        return await safe_answer(cb, "⚠️ Некорректные данные", alert=True)
+
+    mode = (parts[2] or "").strip().lower()
+    if mode not in (CONTACT_MODE_CONTACTS, CONTACT_MODE_BOT, CONTACT_MODE_BOTH):
+        return await safe_answer(cb, "⚠️ Некорректный режим", alert=True)
+
+    async with get_sessionmaker()() as session:
+        await AdRepo(session).patch_payload(ad_id, contact_mode=mode)
+
+    await state.update_data(**{"clean_thread_hint_key": "media_choice"})
+    await state.set_state(SeekerForm.media_choice)
+    try:
+        if cb.message:
+            photo_msg = await cb.message.answer(
+                "Ок. Теперь медиа.\n\nДобавить 🎞 медиа?\n\nСейчас доступно:\n• 1 фото\n• или 1 короткое видео до 15 сек и до 5 МБ\n\n",
+                reply_markup=seeker_media_choice_kb(),
+            )
+            await track_cleanup_message(state, photo_msg)
+    except Exception:
+        pass
+
+
+@router.callback_query(F.data == "seek_media_add")
+async def seek_media_add(cb: CallbackQuery, state: FSMContext):
+    await safe_answer(cb)
+    await state.set_state(SeekerForm.media_wait)
+    if cb.message:
+        sent = await cb.message.answer("Пришли ОДНО медиа одним сообщением: либо 1 фото, либо 1 короткое видео до 15 сек и до 5 МБ.")
+    else:
+        sent = await cb.bot.send_message(cb.from_user.id, "Пришли ОДНО медиа одним сообщением: либо 1 фото, либо 1 короткое видео до 15 сек и до 5 МБ.")
+    await track_cleanup_message(state, sent)
+
+
+@router.callback_query(F.data == "seek_media_skip")
+async def seek_media_skip(cb: CallbackQuery, state: FSMContext):
+    await safe_answer(cb)
+    ad_id = await _get_ad_id(state)
+    if not ad_id:
+        await _need_restart(cb)
+        return
+
+    async with get_sessionmaker()() as session:
+        await AdRepo(session).patch_payload(ad_id, photo_file_id=None, video_file_id=None)
+
+    await state.update_data(**{K_PENDING_MEDIA: None})
+    await state.set_state(SeekerForm.preview)
+    await _upsert_preview(cb.bot, cb.from_user.id, state, ad_id)
+
+
+@router.message(SeekerForm.media_wait, F.photo | F.video)
+async def seek_media_wait_media(message: Message, state: FSMContext):
+    await track_cleanup_message(state, message)
+
+    if getattr(message, "media_group_id", None):
+        sent = await message.answer("Нужно отправить строго ОДНО медиа одним сообщением. Альбом не подходит.")
+        await track_cleanup_message(state, sent)
+        return
+
+    pending = None
+    confirm_text = "Принял медиа. Подтверждаешь?"
+
+    if getattr(message, "video", None):
+        video = message.video
+        duration = int(getattr(video, "duration", 0) or 0)
+        file_size = int(getattr(video, "file_size", 0) or 0)
+        if duration > SEEKER_MAX_VIDEO_SECONDS:
+            sent = await message.answer("Видео слишком длинное. Разрешено только короткое видео до 15 сек.")
+            await track_cleanup_message(state, sent)
+            return
+        if file_size > SEEKER_MAX_VIDEO_SIZE_BYTES:
+            sent = await message.answer("Видео слишком тяжёлое. Разрешено только до 5 МБ.")
+            await track_cleanup_message(state, sent)
+            return
+        pending = {"type": "video", "file_id": video.file_id}
+    else:
+        file_id = message.photo[-1].file_id
+        pending = {"type": "photo", "file_id": file_id}
+
+    await state.update_data(**{K_PENDING_MEDIA: pending})
+    await state.set_state(SeekerForm.media_confirm)
+    sent = await message.answer(confirm_text, reply_markup=media_confirm_kb("seek_media_confirm"))
+    await track_cleanup_message(state, sent)
+
+
+@router.message(SeekerForm.media_wait)
+async def seek_media_wait_bad(message: Message, state: FSMContext):
+    await track_cleanup_message(state, message)
+    sent = await message.answer("Нужно отправить строго ОДНО медиа: либо 1 фото, либо 1 короткое видео до 15 сек и до 5 МБ. Альбом не подходит.")
+    await track_cleanup_message(state, sent)
+
+
+@router.callback_query(F.data.startswith("seek_media_confirm:"))
+async def seek_media_confirm(cb: CallbackQuery, state: FSMContext):
+    await safe_answer(cb)
+    action = (cb.data or "").split(":")[1]
+
+    ad_id = await _get_ad_id(state)
+    if not ad_id:
+        await _need_restart(cb)
+        return
+
+    data = await state.get_data()
+    pending = data.get(K_PENDING_MEDIA)
+
+    if action == "retry":
+        await state.update_data(**{K_PENDING_MEDIA: None})
+        await state.set_state(SeekerForm.media_wait)
+        if cb.message:
+            sent = await cb.message.answer("Ок. Пришли другое медиа: либо 1 фото, либо 1 короткое видео до 15 сек и до 5 МБ.")
+        else:
+            sent = await cb.bot.send_message(cb.from_user.id, "Ок. Пришли другое медиа: либо 1 фото, либо 1 короткое видео до 15 сек и до 5 МБ.")
+        await track_cleanup_message(state, sent)
+        return
+
+    if action == "delete":
+        async with get_sessionmaker()() as session:
+            await AdRepo(session).patch_payload(ad_id, photo_file_id=None, video_file_id=None)
+        await state.update_data(**{K_PENDING_MEDIA: None})
+        hint = await send_saved_hint(cb)
+        await track_cleanup_message(state, hint)
+        await state.update_data(**{K_PENDING_MEDIA: None})
+        await state.set_state(SeekerForm.preview)
+        await _upsert_preview(cb.bot, cb.from_user.id, state, ad_id)
+        return
+
+    if not pending or not isinstance(pending, dict) or not pending.get("file_id"):
+        await safe_answer(cb, "⚠️ Не вижу медиа. Пришли ещё раз.", alert=True)
+        await state.set_state(SeekerForm.media_wait)
+        return
+
+    fid = pending.get("file_id")
+    mtype = str(pending.get("type") or "").strip().lower()
+    async with get_sessionmaker()() as session:
+        if mtype == "video":
+            await AdRepo(session).patch_payload(ad_id, photo_file_id=None, video_file_id=fid)
+        else:
+            await AdRepo(session).patch_payload(ad_id, photo_file_id=fid, video_file_id=None)
+
+    try:
+        if cb.message:
+            await cb.message.edit_reply_markup(reply_markup=media_confirmed_stub_kb())
+    except Exception:
+        pass
+
+    await state.update_data(**{K_PENDING_MEDIA: None})
+    hint = await send_saved_hint(cb)
+    await track_cleanup_message(state, hint)
+    await state.update_data(**{K_PENDING_MEDIA: None})
+    await state.set_state(SeekerForm.preview)
+    await _upsert_preview(cb.bot, cb.from_user.id, state, ad_id)
+
+
+
+
+
+async def _edit_metro_card(cb: CallbackQuery, text: str, reply_markup=None) -> None:
+    if not cb.message:
+        return
+    try:
+        await cb.message.edit_text(text, reply_markup=reply_markup)
+    except Exception as e:
+        if "message is not modified" in str(e).lower():
+            return
+        raise
+
+
+@router.callback_query(StateFilter(SeekerForm.location), F.data == METRO_CLOSE_CALLBACK)
+async def _metro_close(cb: CallbackQuery):
+    await safe_answer(cb)
+    try:
+        await _edit_metro_card(cb, _prompt_location(), reply_markup=metro_location_keyboard())
+    except Exception:
+        pass
+
+
+@router.callback_query(StateFilter(SeekerForm.location), F.data.startswith(METRO_PICK_CALLBACK))
+async def _metro_pick(cb: CallbackQuery, state: FSMContext):
+    await safe_answer(cb)
+    parts = (cb.data or '').split(':')
+    page = int(parts[1]) if len(parts) > 1 and parts[1].isdigit() else 0
+    try:
+        await _edit_metro_card(cb, 'Выбери линию метро Москвы:', reply_markup=metro_lines_keyboard(page))
+    except Exception:
+        pass
+
+
+@router.callback_query(StateFilter(SeekerForm.location), F.data.startswith(METRO_LINE_CALLBACK + ':'))
+async def _metro_line_pick(cb: CallbackQuery, state: FSMContext):
+    await safe_answer(cb)
+    parts = (cb.data or '').split(':')
+    if len(parts) < 3:
+        return
+    line_uid = parts[1]
+    page = int(parts[2]) if parts[2].isdigit() else 0
+    try:
+        await _edit_metro_card(cb, 'Выбери станцию метро:', reply_markup=metro_stations_keyboard(line_uid, page))
+    except Exception:
+        pass
+
+
+@router.callback_query(StateFilter(SeekerForm.location), F.data.startswith(METRO_STATION_CALLBACK + ':'))
+async def _metro_station_pick(cb: CallbackQuery, state: FSMContext):
+    await safe_answer(cb)
+    parts = (cb.data or '').split(':')
+    if len(parts) < 3:
+        return
+    line_uid = parts[1]
+    station = resolve_station(line_uid, int(parts[2]))
+    if not station:
+        return await safe_answer(cb, '⚠️ Не удалось определить станцию', alert=True)
+
+    location_value = build_moscow_location(station)
+    data = await state.get_data()
+    ad_id = data.get('ad_id')
+    if not ad_id:
+        return await safe_answer(cb, '⚠️ Сессия сбилась. Нажми /start.', alert=True)
+
+    async with get_sessionmaker()() as session:
+        await AdRepo(session).patch_payload(int(ad_id), location=location_value)
+
+    if _is_edit_mode(data):
+        await state.update_data(**{K_EDIT_MODE: False, K_PENDING_MEDIA: None})
+        await state.set_state(SeekerForm.preview)
+        try:
+            await _edit_metro_card(cb, '✅ Изменения сохранены')
+        except Exception:
+            pass
+        await _send_fresh_preview(cb.bot, cb.from_user.id, state, int(ad_id))
+        return
+
+    await state.set_state(SeekerForm.contacts)
+    try:
+        await _edit_metro_card(cb, f"✅ Локация сохранена: {location_value}\n\n" + _prompt_contacts())
+    except Exception:
+        pass
+
+
+
+
+async def _send_contact_mode_hint(message: Message) -> None:
+    import asyncio
+    import contextlib
+
+    hint = None
+    try:
+        hint = await message.bot.send_message(
+            chat_id=message.chat.id,
+            text="Нажми одну из кнопок выше, чтобы выбрать способ получения откликов.",
+        )
+        await asyncio.sleep(4)
+    except Exception:
+        return
+    finally:
+        with contextlib.suppress(Exception):
+            if hint:
+                await hint.delete()
+
+
+async def _send_photo_choice_hint(message: Message) -> None:
+    import asyncio
+    import contextlib
+
+    hint = None
+    try:
+        hint = await message.bot.send_message(
+            chat_id=message.chat.id,
+            text="Нажми одну из кнопок выше: ➕ Добавить медиа или ⏭ Без медиа.",
+        )
+        await asyncio.sleep(4)
+    except Exception:
+        return
+    finally:
+        with contextlib.suppress(Exception):
+            if hint:
+                await hint.delete()
+
+
+@router.message(SeekerForm.media_choice, F.text)
+async def _contact_mode_clean_thread(message: Message, state: FSMContext):
+    import contextlib
+
+    raw = (message.text or "").strip()
+    if not raw or raw.startswith("/"):
+        return
+
+    with contextlib.suppress(Exception):
+        await message.delete()
+
+    data = await state.get_data()
+    hk = str((data or {}).get("clean_thread_hint_key") or "").strip().lower()
+
+    if hk == "media_choice":
+        await _send_photo_choice_hint(message)
+        return
+
+    await _send_contact_mode_hint(message)
+
+
+@router.message(StateFilter(SeekerForm.preview, SeekerForm.media_choice, SeekerForm.media_confirm))
+async def seeker_buttons_only_trash(message: Message, state: FSMContext):
+    await track_cleanup_message(state, message)
+
+    try:
+        await delete_user_input_message(message)
+    except Exception:
+        pass
+
+    try:
+        cur = await state.get_state()
+    except Exception:
+        cur = None
+
+    if cur == SeekerForm.preview.state:
+        hint_text = "Используй кнопки выше: исправить поле, изменить медиа или отправить объявление на модерацию."
+    elif cur == SeekerForm.media_choice.state:
+        hint_text = "Нажми одну из кнопок выше: ➕ Добавить медиа или ⏭ Без медиа."
+    else:
+        hint_text = "Используй кнопки выше."
+
+    try:
+        sent = await message.answer(hint_text)
+        await track_cleanup_message(state, sent)
+    except Exception:
+        pass
+
+
+@router.callback_query(F.data.startswith("send_seeker:"))
+async def seek_send(cb: CallbackQuery):
+    await safe_answer(cb)
+    ad_id = _parse_id(cb.data)
+
+    if not is_unlimited(int(cb.from_user.id), getattr(cb.from_user, "username", None)):
+        published = await _published_today(int(cb.from_user.id))
+        if published >= DAILY_FREE_LIMIT:
+            warn = _limit_block_text(published)
+            try:
+                await safe_answer(cb, warn, alert=True)
+            except Exception:
+                pass
+            try:
+                await cb.bot.send_message(cb.from_user.id, warn)
+            except Exception:
+                pass
+            return
+
+    async with get_sessionmaker()() as session:
+        repo = AdRepo(session)
+        ad = await repo.get(ad_id)
+        if not ad:
+            return await safe_answer(cb, "❌ Не найдено", alert=True)
+
+        if ad.status == "pending":
+            return await safe_answer(cb, "⏳ Уже на модерации", alert=True)
+        if ad.status == "published":
+            return await safe_answer(cb, "⚠️ Уже опубликовано", alert=True)
+
+        payload = ad.payload or {}
+        if not (payload.get("contact_mode") in (CONTACT_MODE_CONTACTS, CONTACT_MODE_BOT, CONTACT_MODE_BOTH)):
+            await safe_answer(cb, "⚠️ Сначала выбери, как принимать отклики.", alert=True)
+            try:
+                await cb.bot.send_message(cb.from_user.id, _prompt_contact_mode(), reply_markup=_contact_mode_keyboard_2(ad_id))
+            except Exception:
+                pass
+            return
+
+        mod_chat_id = _get_moderation_chat_id()
+        thread_id = _get_thread_vacancies()
+
+        base_text = get_ad_text(ad)
+        text = _sanitize_moderation_text(base_text + _moderation_user_footer(cb))
+
+        photo_id = payload.get("photo_file_id")
+
+        send_kwargs = {}
+        if thread_id:
+            send_kwargs["message_thread_id"] = thread_id
+
+        if photo_id:
+            msg = await cb.bot.send_photo(mod_chat_id, photo=photo_id, caption=text, reply_markup=moderation_keyboard(ad_id), **send_kwargs)
+        else:
+            msg = await cb.bot.send_message(mod_chat_id, text, reply_markup=moderation_keyboard(ad_id), **send_kwargs)
+
+        await repo.set_status(ad_id, "pending")
+
+        preview_chat_id = int(cb.message.chat.id) if cb.message else int(cb.from_user.id)
+        preview_message_id = int(cb.message.message_id) if cb.message else 0
+        preview_is_media = bool(getattr(cb.message, "caption", None) is not None) if cb.message else False
+
+        await repo.patch_payload(
+            ad_id,
+            moderation_chat_id=msg.chat.id,
+            moderation_message_id=msg.message_id,
+            author_id=cb.from_user.id,
+            role="seeker",
+            preview_chat_id=preview_chat_id,
+            preview_message_id=preview_message_id,
+            preview_is_media=preview_is_media,
+            preview_status="moderation",
+            rejected_reason=None,
+            rejected_field=None,
+            reject_notice_chat_id=None,
+            reject_notice_message_id=None,
+        )
+
+    try:
+        if cb.message:
+            try:
+                await cb.message.edit_reply_markup(reply_markup=sent_to_moderation_stub_kb())
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+    return await safe_answer(cb, "✅ Отправлено на модерацию", alert=True)

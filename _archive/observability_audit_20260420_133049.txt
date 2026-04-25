@@ -1,0 +1,79 @@
+===== OBSERVABILITY MATRIX =====
+findex_bot/bot.py | routes=0 | logs=22 | tokens=polling-guard
+findex_bot/jobs.py | routes=0 | logs=8 | tokens=-
+findex_bot/resurrection_worker.py | routes=0 | logs=9 | tokens=-
+findex_bot/middlewares/fsm_watchdog.py | routes=0 | logs=4 | tokens=FSM_WD_DEBUG
+findex_bot/utils/alerts.py | routes=0 | logs=15 | tokens=alerts:
+findex_bot/utils/ui_surface.py | routes=0 | logs=2 | tokens=ui_surface(shadow)
+findex_bot/handlers/start.py | routes=5 | logs=1 | tokens=shadow mismatch
+findex_bot/handlers/menu.py | routes=9 | logs=0 | tokens=-
+findex_bot/handlers/alerts.py | routes=17 | logs=2 | tokens=alerts:
+findex_bot/handlers/responds.py | routes=37 | logs=103 | tokens=RESP_DEBUG,INTRO_CONTINUE
+findex_bot/handlers/forms.py | routes=7 | logs=31 | tokens=-
+findex_bot/handlers/diagnostics.py | routes=2 | logs=6 | tokens=-
+findex_bot/handlers/moderation.py | routes=2 | logs=0 | tokens=-
+findex_bot/handlers/employer.py | routes=23 | logs=0 | tokens=-
+findex_bot/handlers/seeker.py | routes=23 | logs=0 | tokens=-
+
+===== WEAK ZONES (routes>0 and logs<=2) =====
+findex_bot/handlers/start.py | routes=5 | logs=1
+findex_bot/handlers/menu.py | routes=9 | logs=0
+findex_bot/handlers/alerts.py | routes=17 | logs=2
+findex_bot/handlers/moderation.py | routes=2 | logs=0
+findex_bot/handlers/employer.py | routes=23 | logs=0
+findex_bot/handlers/seeker.py | routes=23 | logs=0
+
+===== ZERO-LOG CRITICAL FILES =====
+findex_bot/handlers/menu.py
+findex_bot/handlers/moderation.py
+findex_bot/handlers/employer.py
+findex_bot/handlers/seeker.py
+
+===== KEY EVENT LINES =====
+findex_bot/bot.py:234: logging.exception("⚠️ polling-guard: Redis SET failed -> fallback to file lock")
+findex_bot/bot.py:238: logging.info("✅ polling-guard: Redis lock acquired")
+findex_bot/bot.py:247: logging.error("⛔ polling-guard: Redis is None (lost connection). Stopping polling.")
+findex_bot/bot.py:257: logging.warning("⚠️ polling-guard: lock missing, trying to re-acquire")
+findex_bot/bot.py:261: logging.error("⛔ polling-guard: failed to re-acquire lock, stopping polling")
+findex_bot/bot.py:270: logging.error("⛔ polling-guard: Redis lock lost (token mismatch). Stopping polling.")
+findex_bot/bot.py:278: logging.exception("⚠️ polling-guard: Redis renew failed. Stopping polling to avoid split-brain.")
+findex_bot/bot.py:306: logging.error("⛔ polling-guard: another bot instance is already polling (Redis lock exists)")
+findex_bot/bot.py:319: logging.error("⛔ polling-guard: another bot instance is already polling (file lock exists)")
+findex_bot/bot.py:326: logging.info("✅ polling-guard: file lock acquired")
+findex_bot/bot.py:347: logging.exception("⚠️ polling-guard: file lock failed")
+findex_bot/middlewares/fsm_watchdog.py:188: "FSM_WD_DEBUG user_id=%s state=%r keys=%s text=%r",
+findex_bot/utils/alerts.py:26: KEY_ALERTS_USER = "alerts:{user_id}"                      # json list
+findex_bot/utils/alerts.py:130: def active_alerts_for_role(alerts: list[dict], target_role: str) -> list[dict]:
+findex_bot/utils/alerts.py:146: def can_create_alert(user_id: int, target_role: str, alerts: list[dict]) -> bool:
+findex_bot/utils/alerts.py:396: async def set_user_alerts(user_id: int, alerts: list[dict]) -> None:
+findex_bot/utils/alerts.py:420: async def _rebuild_user_target_index(user_id: int, alerts: list[dict]) -> None:
+findex_bot/utils/alerts.py:478: for a in alerts:
+findex_bot/utils/alerts.py:600: logger.exception("alerts: delivered SADD failed")
+findex_bot/utils/alerts.py:619: logger.exception("alerts: sismember bot-blocked failed user_id=%s", uid)
+findex_bot/utils/alerts.py:636: logger.exception("alerts: sadd bot-blocked failed user_id=%s", uid)
+findex_bot/utils/alerts.py:674: logger.exception("alerts: _check_subscription failed user_id=%s", user_id)
+findex_bot/utils/alerts.py:693: logger.exception("alerts: parse _check_subscription failed user_id=%s", user_id)
+findex_bot/utils/alerts.py:715: logger.warning("alerts: invalid role for ad_id=%s raw_role=%r", ad_id, ad_data.get("role"))
+findex_bot/utils/alerts.py:748: logger.exception("alerts: smembers failed role=%s", ad_role)
+findex_bot/utils/alerts.py:772: logger.info("alerts: skip user=%s ad_id=%s reason=project_blocked", uid, ad_id)
+findex_bot/utils/alerts.py:776: logger.info("alerts: skip user=%s ad_id=%s reason=bot_blocked_cached", uid, ad_id)
+findex_bot/utils/alerts.py:781: logger.info("alerts: skip user=%s ad_id=%s reason=not_subscribed", uid, ad_id)
+findex_bot/utils/alerts.py:785: if not alerts:
+findex_bot/utils/alerts.py:788: for a in alerts:
+findex_bot/utils/alerts.py:799: "alerts: skip user=%s alert_id=%s ad_id=%s reason=dedup",
+findex_bot/utils/alerts.py:816: "alerts: sent user=%s alert_id=%s ad_id=%s",
+findex_bot/utils/alerts.py:825: "alerts: mark bot-blocked user=%s alert_id=%s ad_id=%s",
+findex_bot/utils/alerts.py:832: "alerts: send failed user=%s alert_id=%s ad_id=%s",
+findex_bot/utils/alerts.py:839: logger.exception("alerts: pipeline failed user=%s ad_id=%s", uid, ad_id)
+findex_bot/utils/ui_surface.py:16: logger.info("ui_surface(shadow): enter user_id=%s surface=%s", user_id, surface)
+findex_bot/utils/ui_surface.py:23: logger.info("ui_surface(shadow): clear user_id=%s", user_id)
+findex_bot/handlers/start.py:217: "start fallback shadow mismatch: user_id=%s legacy_surface=%s shadow_surface=%s",
+findex_bot/handlers/alerts.py:145: logger.exception("alerts: _check_subscription failed user_id=%s", user_id)
+findex_bot/handlers/alerts.py:164: logger.exception("alerts: failed to parse _check_subscription result user_id=%s", user_id)
+findex_bot/handlers/alerts.py:858: for a in alerts:
+findex_bot/handlers/responds.py:117: CB_INTRO_CONTINUE = "resp_intro_continue"
+findex_bot/handlers/responds.py:1247: [InlineKeyboardButton(text="⚡ Откликнуться за 1 минуту", callback_data=f"{CB_INTRO_CONTINUE}:{ad_id}")],
+findex_bot/handlers/responds.py:2890: @router.callback_query(F.data.startswith(f"{CB_INTRO_CONTINUE}:"))
+findex_bot/handlers/responds.py:2900: "INTRO_CONTINUE: user_id=%s ad_id=%s cb_data=%s",
+findex_bot/handlers/responds.py:3874: "RESP_DEBUG user_id=%s state=%r hint=%r text=%r",
+findex_bot/handlers/responds.py:3903: "RESP_DEBUG delete_hint chat_id=%s mid=%s",

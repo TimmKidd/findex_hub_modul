@@ -38,6 +38,15 @@ from findex_bot.utils.ui_utils import (
     cleanup_tracked_messages,
 )
 
+from findex_bot.handlers.responds_parts.intro_service import (
+    _store_intro_message as _store_intro_message_impl,
+    _load_intro_message as _load_intro_message_impl,
+    _clear_intro_message as _clear_intro_message_impl,
+    _clear_all_intro_messages as _clear_all_intro_messages_impl,
+    _upsert_intro_message as _upsert_intro_message_impl,
+    _upsert_service_message as _upsert_service_message_impl,
+)
+
 logger = logging.getLogger(__name__)
 router = Router()
 
@@ -61,7 +70,18 @@ SUBMIT_LOCK_KEY = "respond:submit_lock:{user_id}:{ad_id}"
 INTRO_KEY = "respond:intro:{user_id}:{ad_id}"
 
 ACTIVE_KEY = "respond:active:{user_id}"
+ACTIVE_VIEW_KEY = "respond:active_view:{user_id}"
+
+from findex_bot.utils.hints_registry import (
+    RESPOND_CITIZENSHIP_PICK_TRASH,
+    RESPOND_EXISTING_NOTICE_TRASH,
+    RESPOND_FORM_PREVIEW_TRASH,
+    RESPOND_INTRO_CHOICE_TRASH,
+    RESPOND_SAVED_CHOICE_TRASH,
+    get_hint_text,
+)
 ACTIVE_TTL_SEC = RESPOND_TTL_DAYS * 24 * 60 * 60
+ACTIVE_VIEW_TTL_SEC = 60 * 60
 
 REJECT_NOTICE_DELETE_SEC = 6
 
@@ -226,6 +246,18 @@ async def _set_active_respond(redis: Any, user_id: int, respond_id: int) -> None
     r = _get_redis(redis)
     key = ACTIVE_KEY.format(user_id=int(user_id))
     await r.set(key, str(int(respond_id)), ex=int(ACTIVE_TTL_SEC))
+
+
+async def _set_active_respond_view(redis: Any, user_id: int) -> None:
+    r = _get_redis(redis)
+    key = ACTIVE_VIEW_KEY.format(user_id=int(user_id))
+    await r.set(key, "1", ex=int(ACTIVE_VIEW_TTL_SEC))
+
+
+async def _clear_active_respond_view(redis: Any, user_id: int) -> None:
+    r = _get_redis(redis)
+    key = ACTIVE_VIEW_KEY.format(user_id=int(user_id))
+    await r.delete(key)
 
 
 def _ad_is_expired(ad_created_at: datetime) -> bool:
@@ -564,53 +596,57 @@ def _draft_belongs_to_ad(data: dict | None, ad_id: int) -> bool:
         return False
 
 
+
+
+
+
+
+
+
+
+
+
+
+
 async def _store_intro_message(redis: Any, user_id: int, ad_id: int, message_id: int) -> None:
-    r = _get_redis(redis)
-    key = INTRO_KEY.format(user_id=int(user_id), ad_id=int(ad_id))
-    await r.set(key, str(int(message_id)), ex=PENDING_RESPOND_TTL_MIN * 60)
+    return await _store_intro_message_impl(
+        redis,
+        user_id,
+        ad_id,
+        message_id,
+        get_redis_fn=_get_redis,
+        intro_key_template=INTRO_KEY,
+        pending_respond_ttl_min=PENDING_RESPOND_TTL_MIN,
+    )
 
 
 async def _load_intro_message(redis: Any, user_id: int, ad_id: int) -> int | None:
-    try:
-        r = _get_redis(redis)
-        key = INTRO_KEY.format(user_id=int(user_id), ad_id=int(ad_id))
-        raw = await r.get(key)
-        if not raw:
-            return None
-
-        if isinstance(raw, bytes):
-            raw = raw.decode("utf-8", errors="ignore")
-
-        return int(str(raw).strip())
-    except Exception:
-        logger.exception("_load_intro_message failed user_id=%s ad_id=%s", user_id, ad_id)
-        return None
+    return await _load_intro_message_impl(
+        redis,
+        user_id,
+        ad_id,
+        get_redis_fn=_get_redis,
+        intro_key_template=INTRO_KEY,
+    )
 
 
 async def _clear_intro_message(redis: Any, user_id: int, ad_id: int) -> None:
-    with contextlib.suppress(Exception):
-        r = _get_redis(redis)
-        key = INTRO_KEY.format(user_id=int(user_id), ad_id=int(ad_id))
-        await r.delete(key)
+    return await _clear_intro_message_impl(
+        redis,
+        user_id,
+        ad_id,
+        get_redis_fn=_get_redis,
+        intro_key_template=INTRO_KEY,
+    )
 
 
 async def _clear_all_intro_messages(redis: Any, user_id: int) -> None:
-    """
-    Чистит все intro/service-message ключи пользователя по всем объявлениям.
-    Нужен только для полного hard-reset, когда пользователь переключается
-    между разными объявлениями или мы сознательно обнуляем весь flow.
-    """
-    with contextlib.suppress(Exception):
-        r = _get_redis(redis)
-        pattern = INTRO_KEY.format(user_id=int(user_id), ad_id="*")
-
-        cursor = 0
-        while True:
-            cursor, keys = await r.scan(cursor=cursor, match=pattern, count=100)
-            if keys:
-                await r.delete(*keys)
-            if cursor == 0:
-                break
+    return await _clear_all_intro_messages_impl(
+        redis,
+        user_id,
+        get_redis_fn=_get_redis,
+        intro_key_template=INTRO_KEY,
+    )
 
 
 async def _upsert_intro_message(
@@ -622,40 +658,46 @@ async def _upsert_intro_message(
     *,
     reply_markup: InlineKeyboardMarkup | None = None,
 ):
-    prev_msg_id = await _load_intro_message(redis, int(user_id), int(ad_id))
-    lp = LinkPreviewOptions(is_disabled=True)
-    kb = reply_markup or intro_kb(int(ad_id))
-
-    if prev_msg_id:
-        try:
-            await bot.edit_message_text(
-                chat_id=int(user_id),
-                message_id=int(prev_msg_id),
-                text=text,
-                parse_mode=ParseMode.HTML,
-                reply_markup=kb,
-                link_preview_options=lp,
-            )
-            await _store_intro_message(redis, int(user_id), int(ad_id), int(prev_msg_id))
-            return int(prev_msg_id)
-        except Exception as e:
-            if "message is not modified" in str(e).lower():
-                await _store_intro_message(redis, int(user_id), int(ad_id), int(prev_msg_id))
-                return int(prev_msg_id)
-
-            with contextlib.suppress(Exception):
-                await bot.delete_message(chat_id=int(user_id), message_id=int(prev_msg_id))
-
-    m = await bot.send_message(
-        chat_id=int(user_id),
-        text=text,
-        parse_mode=ParseMode.HTML,
-        reply_markup=kb,
-        link_preview_options=lp,
+    return await _upsert_intro_message_impl(
+        bot,
+        redis,
+        user_id,
+        ad_id,
+        text,
+        reply_markup=reply_markup,
+        load_intro_message_fn=_load_intro_message_impl,
+        store_intro_message_fn=_store_intro_message_impl,
+        intro_kb_fn=intro_kb,
+        get_redis_fn=_get_redis,
+        intro_key_template=INTRO_KEY,
+        pending_respond_ttl_min=PENDING_RESPOND_TTL_MIN,
     )
-    await _store_intro_message(redis, int(user_id), int(ad_id), int(m.message_id))
-    return int(m.message_id)
 
+
+async def _upsert_service_message(
+    bot,
+    redis: Any,
+    user_id: int,
+    ad_id: int,
+    text: str,
+    *,
+    reply_markup: InlineKeyboardMarkup | None = None,
+    parse_mode: ParseMode | None = ParseMode.HTML,
+) -> int:
+    return await _upsert_service_message_impl(
+        bot,
+        redis,
+        user_id,
+        ad_id,
+        text,
+        reply_markup=reply_markup,
+        parse_mode=parse_mode,
+        load_intro_message_fn=_load_intro_message_impl,
+        store_intro_message_fn=_store_intro_message_impl,
+        get_redis_fn=_get_redis,
+        intro_key_template=INTRO_KEY,
+        pending_respond_ttl_min=PENDING_RESPOND_TTL_MIN,
+    )
 
 def _prompt_ad_title(ad: Ad) -> str:
     try:
@@ -697,50 +739,6 @@ def _build_author_reply_prompt(ad: Ad, respond: Respond) -> str:
     )
 
 
-async def _upsert_service_message(
-    bot,
-    redis: Any,
-    user_id: int,
-    ad_id: int,
-    text: str,
-    *,
-    reply_markup: InlineKeyboardMarkup | None = None,
-    parse_mode: ParseMode | None = ParseMode.HTML,
-) -> int:
-    prev_msg_id = await _load_intro_message(redis, int(user_id), int(ad_id))
-    lp = LinkPreviewOptions(is_disabled=True)
-
-    if prev_msg_id:
-        try:
-            await bot.edit_message_text(
-                chat_id=int(user_id),
-                message_id=int(prev_msg_id),
-                text=text,
-                parse_mode=parse_mode,
-                reply_markup=reply_markup,
-                link_preview_options=lp,
-            )
-            await _store_intro_message(redis, int(user_id), int(ad_id), int(prev_msg_id))
-            return int(prev_msg_id)
-
-        except Exception as e:
-            if "message is not modified" in str(e).lower():
-                await _store_intro_message(redis, int(user_id), int(ad_id), int(prev_msg_id))
-                return int(prev_msg_id)
-
-            with contextlib.suppress(Exception):
-                await bot.delete_message(chat_id=int(user_id), message_id=int(prev_msg_id))
-
-    m = await bot.send_message(
-        chat_id=int(user_id),
-        text=text,
-        parse_mode=parse_mode,
-        reply_markup=reply_markup,
-        link_preview_options=lp,
-    )
-
-    await _store_intro_message(redis, int(user_id), int(ad_id), int(m.message_id))
-    return int(m.message_id)
 
 
 def _build_candidate_reply_prompt(ad: Ad, respond: Respond) -> str:
@@ -853,27 +851,14 @@ async def _delete_form_preview_message(
     *,
     fallback_message_id: int | None = None,
 ) -> None:
-    """
-    Гарантированно удаляет preview-анкету, если она ещё висит.
-    Используется в success/duplicate ветках form_send.
-    """
-    ids: set[int] = set()
+    from findex_bot.handlers.responds_parts.form_preview_refs import delete_form_preview_message
 
-    with contextlib.suppress(Exception):
-        data = await state.get_data()
-        prev_id = data.get("form_preview_message_id")
-        if prev_id:
-            ids.add(int(prev_id))
-
-    if fallback_message_id:
-        ids.add(int(fallback_message_id))
-
-    for msg_id in ids:
-        with contextlib.suppress(Exception):
-            await bot.delete_message(chat_id=int(chat_id), message_id=int(msg_id))
-
-    with contextlib.suppress(Exception):
-        await state.update_data(form_preview_message_id=None)
+    await delete_form_preview_message(
+        bot=bot,
+        state=state,
+        chat_id=chat_id,
+        fallback_message_id=fallback_message_id,
+    )
 
 
 async def _delete_intro_service_message(
@@ -1024,7 +1009,7 @@ async def _send_intro_trash_hint(bot, redis: Any, user_id: int) -> None:
     await _send_ephemeral_notice(
         bot,
         int(user_id),
-        "👆 Нажми кнопку «⚡ Откликнуться за 1 минуту» выше.",
+        get_hint_text(RESPOND_INTRO_CHOICE_TRASH),
         seconds=3,
     )
 
@@ -2511,7 +2496,7 @@ async def saved_choice_clean_thread(message: Message, state: FSMContext):
             message.bot,
             int(message.chat.id),
             state,
-            "Используй кнопки в карточке выше.",
+            get_hint_text(RESPOND_SAVED_CHOICE_TRASH),
             ttl_sec=3.0,
         )
 
@@ -2536,6 +2521,12 @@ async def wait_hint(cb: CallbackQuery):
 @router.callback_query(F.data == CB_MENU_OPEN)
 async def open_menu_from_respond_card(cb: CallbackQuery):
     await safe_answer(cb)
+
+    try:
+        await _clear_active_respond_view(None, int(cb.from_user.id))
+    except Exception:
+        logger.exception("open_menu_from_respond_card: failed to clear active view user_id=%s", cb.from_user.id)
+
     try:
         from findex_bot.handlers import menu as menu_mod  # type: ignore
         fn = getattr(menu_mod, "_send_or_edit_menu", None)
@@ -2556,6 +2547,11 @@ async def respond_to_menu(cb: CallbackQuery, state: FSMContext, redis: Any = Non
         ad_id = int((cb.data or "").split(":")[1])
     except Exception:
         ad_id = 0
+
+    try:
+        await _clear_active_respond_view(redis, int(cb.from_user.id))
+    except Exception:
+        logger.exception("respond_to_menu: failed to clear active view user_id=%s", cb.from_user.id)
 
     try:
         r = _get_redis(redis)
@@ -2625,7 +2621,7 @@ async def respond_back(cb: CallbackQuery, state: FSMContext, redis: Any = None):
 
 
 @router.callback_query(F.data.startswith(f"{CB_RESUME}:"))
-async def resume_respond(cb: CallbackQuery, redis: Any = None):
+async def resume_respond(cb: CallbackQuery, state: FSMContext, redis: Any = None):
     await safe_answer(cb)
 
     try:
@@ -2678,6 +2674,7 @@ async def resume_respond(cb: CallbackQuery, redis: Any = None):
             old_candidate_message_id = int(getattr(r, "candidate_message_id", 0) or 0)
 
             logger.warning(
+                "resume_respond: candidate resume enter respond_id=%s old_chat_id=%s old_message_id=%s source_message_id=%s",
                 respond_id,
                 old_candidate_chat_id,
                 old_candidate_message_id,
@@ -2691,12 +2688,14 @@ async def resume_respond(cb: CallbackQuery, redis: Any = None):
                         message_id=old_candidate_message_id,
                     )
                     logger.warning(
+                        "resume_respond: deleted old candidate card respond_id=%s old_chat_id=%s old_message_id=%s",
                         respond_id,
                         old_candidate_chat_id,
                         old_candidate_message_id,
                     )
                 except Exception:
                     logger.exception(
+                        "resume_respond: failed to delete old candidate card respond_id=%s old_chat_id=%s old_message_id=%s",
                         respond_id,
                         old_candidate_chat_id,
                         old_candidate_message_id,
@@ -2711,6 +2710,7 @@ async def resume_respond(cb: CallbackQuery, redis: Any = None):
             )
 
             logger.warning(
+                "resume_respond: candidate card sent respond_id=%s chat_id=%s message_id=%s",
                 respond_id,
                 int(sent.chat.id),
                 int(sent.message_id),
@@ -2736,10 +2736,24 @@ async def resume_respond(cb: CallbackQuery, redis: Any = None):
             return await safe_answer(cb, "🚫 Недостаточно прав", alert=True)
 
     try:
+        await state.clear()
+    except Exception:
+        logger.exception("resume_respond: state.clear failed user_id=%s", cb.from_user.id)
+
+    try:
         await _set_active_respond(redis, int(cb.from_user.id), int(respond_id))
     except Exception:
         logger.exception(
             "resume_respond: failed to set active respond user_id=%s respond_id=%s",
+            cb.from_user.id,
+            respond_id,
+        )
+
+    try:
+        await _set_active_respond_view(redis, int(cb.from_user.id))
+    except Exception:
+        logger.exception(
+            "resume_respond: failed to set active view user_id=%s respond_id=%s",
             cb.from_user.id,
             respond_id,
         )
@@ -2755,7 +2769,7 @@ async def resume_respond(cb: CallbackQuery, redis: Any = None):
 
 
 @router.callback_query(F.data.startswith(f"{CB_OPEN_FROM_LIST}:"))
-async def open_respond_from_list(cb: CallbackQuery):
+async def open_respond_from_list(cb: CallbackQuery, state: FSMContext):
     await safe_answer(cb)
 
     parts = (cb.data or "").split(":")
@@ -2811,6 +2825,11 @@ async def open_respond_from_list(cb: CallbackQuery):
             page=page,
         )
 
+    try:
+        await state.clear()
+    except Exception:
+        logger.exception("open_respond_from_list: state.clear failed user_id=%s", cb.from_user.id)
+
     await _edit_or_send(
         cb=cb,
         chat_id=int(cb.from_user.id),
@@ -2818,6 +2837,15 @@ async def open_respond_from_list(cb: CallbackQuery):
         reply_markup=kb,
         parse_mode=ParseMode.HTML,
     )
+
+    try:
+        await _set_active_respond_view(None, int(cb.from_user.id))
+    except Exception:
+        logger.exception(
+            "open_respond_from_list: failed to set active view user_id=%s respond_id=%s",
+            cb.from_user.id,
+            respond_id,
+        )
 
 
 
@@ -3152,6 +3180,10 @@ async def fast_respond_send(cb: CallbackQuery, state: FSMContext, redis: Any = N
 
         try:
             await _set_active_respond(redis, int(cb.from_user.id), int(respond.id))
+            # first-entry sync: после первого успешного формирования карточки
+            # ставим active view так же, как это уже делается в resume/open path
+            with contextlib.suppress(Exception):
+                await _set_active_respond_view(redis, int(cb.from_user.id))
         except Exception:
             logger.exception("fast_respond_send: failed to set active respond for candidate user_id=%s respond_id=%s", cb.from_user.id, respond.id)
 
@@ -3234,51 +3266,27 @@ async def _send_form_preview_from_state(bot, chat_id: int, state: FSMContext, re
     except Exception:
         logger.exception("_send_form_preview_from_state: existing respond check failed chat_id=%s ad_id=%s", chat_id, ad_id)
 
-    prof = _candidate_profile_from_state(data)
-    has_resume = _profile_has_resume(prof)
+    from findex_bot.handlers.responds_parts.form_preview_builder import build_form_preview_payload
 
-    text = (
-        "✅ <b>Проверь анкету</b>\n\n"
-        + "\n".join(_render_profile_lines(prof))
-        + "\n\n"
-        "✏️ Чтобы изменить конкретное поле — нажми на кнопку ниже.\n"
-        "Если всё верно — нажми «📨 Отправить отклик»."
+    text, kb, has_resume = build_form_preview_payload(
+        data=data,
+        ad_id=ad_id,
+        candidate_profile_from_state_fn=_candidate_profile_from_state,
+        profile_has_resume_fn=_profile_has_resume,
+        render_profile_lines_fn=_render_profile_lines,
+        form_preview_kb_fn=form_preview_kb,
     )
-    kb = form_preview_kb(ad_id, has_resume=has_resume)
 
-    prev_id = data.get("form_preview_message_id")
-    if prev_id:
-        try:
-            await bot.edit_message_text(
-                chat_id=int(chat_id),
-                message_id=int(prev_id),
-                text=text,
-                parse_mode=ParseMode.HTML,
-                reply_markup=kb,
-                link_preview_options=LinkPreviewOptions(is_disabled=True),
-            )
-        except Exception as e:
-            if "message is not modified" not in str(e).lower():
-                logger.warning("edit form preview failed -> send new: %r", e)
-                m = await bot.send_message(
-                    chat_id=int(chat_id),
-                    text=text,
-                    parse_mode=ParseMode.HTML,
-                    reply_markup=kb,
-                    link_preview_options=LinkPreviewOptions(is_disabled=True),
-                )
-                await state.update_data(form_preview_message_id=int(m.message_id))
-                await _track_form_bot_message(state, m)
-    else:
-        m = await bot.send_message(
-            chat_id=int(chat_id),
-            text=text,
-            parse_mode=ParseMode.HTML,
-            reply_markup=kb,
-            link_preview_options=LinkPreviewOptions(is_disabled=True),
-        )
-        await state.update_data(form_preview_message_id=int(m.message_id))
-        await _track_form_bot_message(state, m)
+    from findex_bot.handlers.responds_parts.form_preview_transport import upsert_form_preview_message
+
+    await upsert_form_preview_message(
+        bot=bot,
+        state=state,
+        chat_id=int(chat_id),
+        text=text,
+        reply_markup=kb,
+        track_form_bot_message_fn=_track_form_bot_message,
+    )
 
     with contextlib.suppress(Exception):
         await state.set_state(RespondFSM.form_preview)
@@ -3290,28 +3298,6 @@ async def _send_form_preview_from_state(bot, chat_id: int, state: FSMContext, re
                 "form_transient_hint_message_id": None,
             }
         )
-        try:
-            dbg_state = await state.get_state()
-            dbg_data = await state.get_data()
-            logger.warning(
-                int(chat_id),
-                dbg_state,
-                dbg_data.get("clean_thread_hint_key"),
-                dbg_data.get("form_preview_message_id"),
-            )
-        except Exception:
-            pass
-        try:
-            dbg_state = await state.get_state()
-            dbg_data = await state.get_data()
-            logger.warning(
-                int(chat_id),
-                dbg_state,
-                dbg_data.get("clean_thread_hint_key"),
-                dbg_data.get("form_preview_message_id"),
-            )
-        except Exception:
-            pass
 
 
 
@@ -3378,7 +3364,7 @@ async def form_preview_clean_thread(message: Message, state: FSMContext):
             message.bot,
             int(message.chat.id),
             state,
-            "Используй кнопки выше.",
+            get_hint_text(RESPOND_FORM_PREVIEW_TRASH),
             ttl_sec=3.0,
         )
 
@@ -3446,7 +3432,7 @@ async def form_existing_notice_clean_thread(message: Message, state: FSMContext)
             message.bot,
             int(message.chat.id),
             state,
-            "Используй кнопку «Открыть мой отклик» в карточке выше.",
+            get_hint_text(RESPOND_EXISTING_NOTICE_TRASH),
             ttl_sec=3.0,
         )
 
@@ -3570,7 +3556,7 @@ async def form_step_citizenship_pick_message(message: Message, state: FSMContext
             message.bot,
             int(message.chat.id),
             state,
-            "⚠️ Здесь нужно выбрать гражданство кнопкой выше.\nЕсли страны нет в списке — нажми «🌍 Другая страна».",
+            get_hint_text(RESPOND_CITIZENSHIP_PICK_TRASH),
             ttl_sec=3.0,
         )
 
@@ -3801,6 +3787,7 @@ async def form_step_resume(message: Message, state: FSMContext):
         dbg_state = await state.get_state()
         dbg_data = await state.get_data()
         logger.warning(
+            "RESP_DEBUG user_id=%s state=%r hint=%r text=%r",
             int(message.from_user.id),
             dbg_state,
             dbg_data.get("clean_thread_hint_key"),
@@ -3829,6 +3816,7 @@ async def form_step_resume(message: Message, state: FSMContext):
                 message_id=int(mid),
             )
             logger.warning(
+                "RESP_DEBUG delete_hint chat_id=%s mid=%s",
                 int(chat_id),
                 int(mid),
             )
@@ -4093,6 +4081,10 @@ async def form_send(cb: CallbackQuery, state: FSMContext, redis: Any = None):
 
         try:
             await _set_active_respond(redis, int(cb.from_user.id), int(respond.id))
+            # first-entry sync: после первого успешного формирования карточки
+            # ставим active view так же, как это уже делается в resume/open path
+            with contextlib.suppress(Exception):
+                await _set_active_respond_view(redis, int(cb.from_user.id))
         except Exception:
             logger.exception("form_send: failed to set active respond for candidate user_id=%s respond_id=%s", cb.from_user.id, respond.id)
 

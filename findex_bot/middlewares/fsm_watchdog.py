@@ -58,40 +58,55 @@ async def _delete_message_later(msg: Message, delay_sec: float = 2.5) -> None:
 
 
 
+from findex_bot.utils.hints_registry import (
+    RESPOND_CITIZENSHIP_PICK_TRASH,
+    RESPOND_FORM_PREVIEW_TRASH,
+    RESPOND_INTRO_CHOICE_TRASH,
+    RESPOND_SAVED_CHOICE_TRASH,
+    VACANCY_CONTACT_MODE_TRASH,
+    VACANCY_MEDIA_CHOICE_TRASH,
+    VACANCY_MEDIA_CONFIRM_TRASH,
+    VACANCY_PREVIEW_TRASH,
+    get_hint_text,
+)
+
 def _clean_thread_hint_for_state(current_state: str, hint_key: str | None = None) -> str:
     hk = str(hint_key or "").strip().lower()
     s = str(current_state or "")
 
     if hk == "contact_mode":
-        return "Нажми одну из кнопок выше: 🔒 Отклики через бота или 📞 Контакты в объявлении."
+        return get_hint_text(VACANCY_CONTACT_MODE_TRASH)
 
     if hk == "media_choice":
-        return "Нажми одну из кнопок выше: ➕ Добавить медиа или ⏭ Без медиа."
+        return get_hint_text(VACANCY_MEDIA_CHOICE_TRASH)
 
     if hk == "media_wait":
         return "Сейчас нужен файл: отправь фото или короткое видео."
 
     if hk == "respond_intro_choice" or s.endswith(":form_intro_choice"):
-        return "👆 Нажми кнопку «⚡ Откликнуться за 1 минуту» выше."
+        return get_hint_text(RESPOND_INTRO_CHOICE_TRASH)
 
     if hk == "respond_saved_choice" or s.endswith(":form_saved_choice"):
-        return "Нажми одну из кнопок выше: ⚡ Быстрый отклик или ✏️ Заполнить заново."
+        return get_hint_text(RESPOND_SAVED_CHOICE_TRASH)
 
     if hk == "respond_form_preview" or s.endswith(":form_preview"):
-        return "Используй кнопки выше: измени поле или отправь отклик."
+        return get_hint_text(RESPOND_FORM_PREVIEW_TRASH)
 
     if s.endswith(":form_citizenship_pick"):
-        return "Здесь нужно выбрать гражданство кнопкой выше. Если страны нет в списке — нажми «🌍 Другая страна»."
+        return get_hint_text(RESPOND_CITIZENSHIP_PICK_TRASH)
 
     if s.endswith(":media_confirm"):
-        return "Нажми одну из кнопок выше: ✅ Подтвердить, 🔁 Заменить или 🗑 Удалить."
+        return get_hint_text(VACANCY_MEDIA_CONFIRM_TRASH)
 
     if s.endswith(":preview"):
-        return "Используй кнопки выше: исправить поле, изменить медиа или отправить объявление на модерацию."
+        return get_hint_text(VACANCY_PREVIEW_TRASH)
 
     if s.endswith(":media_choice"):
-        return "Нажми одну из кнопок выше."
+        return get_hint_text(VACANCY_MEDIA_CHOICE_TRASH)
 
+    # аварийный fallback: если state попал в watchdog, но не сматчился
+    # ни на одну из утверждённых hint-point веток выше
+    logger.warning("fsm_watchdog: emergency fallback hint used for unmatched state=%s", s)
     return "Нажми одну из кнопок выше."
 
 def _is_private_event(event: Any) -> bool:
@@ -170,6 +185,7 @@ class FSMWatchdogMiddleware(BaseMiddleware):
         if isinstance(event, Message):
             try:
                 logger.warning(
+                    "FSM_WD_DEBUG user_id=%s state=%r keys=%s text=%r",
                     int(getattr(getattr(event, "from_user", None), "id", 0) or 0),
                     current_state,
                     sorted(list((st_data or {}).keys())),

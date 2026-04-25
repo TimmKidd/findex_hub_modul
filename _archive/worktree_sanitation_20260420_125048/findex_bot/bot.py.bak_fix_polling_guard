@@ -1,0 +1,537 @@
+# bot.py
+from __future__ import annotations
+
+import os
+import asyncio
+import logging
+import uuid
+import contextlib
+from pathlib import Path
+from dataclasses import dataclass
+
+from dotenv import load_dotenv
+
+from aiogram import Bot, Dispatcher, Router, F
+from aiogram.enums import ParseMode
+from aiogram.client.default import DefaultBotProperties
+from aiogram.client.session.aiohttp import AiohttpSession
+from aiogram.filters import CommandStart
+from aiogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.storage.redis import RedisStorage
+
+import findex_bot.runtime as runtime
+
+from findex_bot.middlewares.subscription import SubscriptionMiddleware
+from findex_bot.middlewares.fsm_watchdog import FSMWatchdogMiddleware
+from findex_bot.middlewares.published_guard import PublishedPreviewGuardMiddleware
+
+logging.basicConfig(level=logging.INFO, force=True)
+
+
+# ---------------- CONFIG ----------------
+@dataclass
+class Config:
+    bot_token: str
+    moderation_chat_id: int
+    main_channel_id: int
+    thread_vacancies: int
+    channel_username: str
+
+
+def _resolve_env_path() -> str:
+    env_path = (os.getenv("ENV_PATH") or "").strip()
+    if env_path:
+        return env_path
+
+    project_root = Path(__file__).resolve().parent.parent
+    return str(project_root / ".env")
+
+
+def load_config() -> Config:
+    env_path = _resolve_env_path()
+    load_dotenv(env_path, override=False)
+
+    token = os.getenv("BOT_TOKEN")
+    if not token:
+        raise RuntimeError(f"BOT_TOKEN not set in env file: {env_path}")
+
+    moderation_chat_id = int(os.getenv("MODERATION_CHAT_ID", 0) or 0)
+    if moderation_chat_id == 0:
+        raise RuntimeError(f"MODERATION_CHAT_ID not set (or equals 0) in env file: {env_path}")
+
+    return Config(
+        bot_token=token,
+        moderation_chat_id=moderation_chat_id,
+        main_channel_id=int(os.getenv("MAIN_CHANNEL_ID", 0) or 0),
+        thread_vacancies=int(os.getenv("THREAD_VACANCIES", 0) or 0),
+        channel_username=os.getenv("CHANNEL_USERNAME", "") or "",
+    )
+
+
+config = load_config()
+
+# ---------- runtime INIT ----------
+runtime.CONFIG = config
+runtime.BOT_TOKEN = config.bot_token
+runtime.MODERATION_CHAT_ID = config.moderation_chat_id
+runtime.MAIN_CHANNEL_ID = config.main_channel_id
+runtime.THREAD_VACANCIES = config.thread_vacancies
+runtime.CHANNEL_USERNAME = config.channel_username
+
+if not hasattr(runtime, "PUBLISHED_PREVIEW_MESSAGES"):
+    runtime.PUBLISHED_PREVIEW_MESSAGES = {}
+if not hasattr(runtime, "ADS_PENDING"):
+    runtime.ADS_PENDING = {}
+if not hasattr(runtime, "ADS_REJECTED"):
+    runtime.ADS_REJECTED = {}
+if not hasattr(runtime, "PUBLISHED_POSTS"):
+    runtime.PUBLISHED_POSTS = {}
+if not hasattr(runtime, "USER_PUB_COUNTER"):
+    runtime.USER_PUB_COUNTER = {}
+
+if not hasattr(runtime, "ALERTS_STORE"):
+    runtime.ALERTS_STORE = {}
+if not hasattr(runtime, "REDIS"):
+    runtime.REDIS = None
+if not hasattr(runtime, "REDIS_URL"):
+    runtime.REDIS_URL = None
+
+if not hasattr(runtime, "BOT_USERNAME"):
+    runtime.BOT_USERNAME = None
+
+# ---------------- ROUTERS ----------------
+from findex_bot.handlers.fsm_watchdog import router as fsm_watchdog_router
+from findex_bot.handlers.subscription import router as subscription_router
+from findex_bot.handlers.start import router as start_router
+from findex_bot.handlers.menu import router as menu_router
+from findex_bot.handlers.help import router as help_router
+from findex_bot.handlers.diagnostics import router as diagnostics_router
+from findex_bot.handlers.system_admin import router as system_admin_router
+from findex_bot.handlers.moderation import router as moderation_router
+from findex_bot.handlers.forms import router as forms_router
+from findex_bot.handlers.employer import router as employer_router
+from findex_bot.handlers.seeker import router as seeker_router
+from findex_bot.handlers.replies import router as replies_router
+from findex_bot.handlers.alerts import router as alerts_router
+from findex_bot.handlers.responds import router as responds_router
+from findex_bot.handlers.inline_share import router as inline_share_router
+
+from findex_bot.handlers.debug_ping import (
+    router as debug_ping_router,
+    CallbackLoggerMiddleware,
+)
+
+from findex_bot.handlers.forms import SavedHintMiddleware
+
+
+# ---------------- DEEP-LINK ROUTER (/start resp_<ad_id>) ----------------
+deeplink_router = Router()
+
+
+@deeplink_router.message(CommandStart(deep_link=True), F.text.regexp(r"^/start\s+resp_\d+\s*$"))
+async def _start_deeplink_entry(message: Message, state: FSMContext):
+    text = (message.text or "").strip()
+    parts = text.split(maxsplit=1)
+    payload = parts[1].strip() if len(parts) > 1 else ""
+
+    ad_part = payload.replace("resp_", "", 1).strip()
+
+    try:
+        ad_id = int(ad_part)
+        if ad_id <= 0:
+            raise ValueError("ad_id must be > 0")
+    except Exception:
+        await message.answer(
+            "⚠️ Некорректная ссылка на объявление.\n"
+            "Открой объявление в канале и нажми «📩 Откликнуться» ещё раз."
+        )
+        return
+
+    try:
+        import findex_bot.handlers.responds as responds_mod  # type: ignore
+
+        for fname in ("start_from_deeplink", "handle_deeplink_start"):
+            fn = getattr(responds_mod, fname, None)
+            if callable(fn):
+                await fn(message, ad_id, state=state, redis=getattr(runtime, "REDIS", None))  # type: ignore
+
+                # Удаляем только техническое /start-сообщение
+                # только в сценарии valid deep-link resp_<ad_id>
+                with contextlib.suppress(Exception):
+                    await message.delete()
+                return
+    except Exception:
+        logging.exception("deeplink -> responds entry failed")
+
+    kb = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="📩 Откликнуться", callback_data=f"respond:{ad_id}")]
+        ]
+    )
+    await message.answer(
+        "📩 Как ты хочешь откликнуться на объявление?\n\n"
+        "Нажми кнопку ниже — бот продолжит отклик.",
+        reply_markup=kb,
+    )
+
+    # И здесь тоже удаляем только техническое /start-сообщение
+    # в рамках того же valid deep-link сценария
+    with contextlib.suppress(Exception):
+        await message.delete()
+
+
+# ---------------- SINGLE INSTANCE GUARD ----------------
+POLLING_LOCK_KEY = os.getenv("POLLING_LOCK_KEY", "findexhub:polling_lock")
+POLLING_LOCK_TTL_SECONDS = 180
+POLLING_LOCK_RENEW_EVERY_SECONDS = 60
+
+# ---------------- REDIS HEALTHCHECK ----------------
+REDIS_HEALTHCHECK_EVERY_SECONDS = 10
+REDIS_RECONNECT_BACKOFF_SECONDS = 3
+
+
+def _build_redis_url() -> str:
+    redis_url = os.getenv("REDIS_URL")
+    if redis_url:
+        return redis_url
+
+    host = os.getenv("REDIS_HOST", "127.0.0.1")
+    port = os.getenv("REDIS_PORT", "6379")
+    password = os.getenv("REDIS_PASSWORD")
+
+    if password:
+        return f"redis://:{password}@{host}:{port}/0"
+    return f"redis://{host}:{port}/0"
+
+
+async def _maybe_close_redis_client(client) -> None:
+    if client is None:
+        return
+    try:
+        if hasattr(client, "aclose"):
+            await client.aclose()
+            return
+    except Exception:
+        pass
+
+    try:
+        res = client.close()
+        if asyncio.iscoroutine(res):
+            await res
+    except Exception:
+        pass
+
+
+async def _acquire_polling_guard(dp: Dispatcher):
+    r0 = getattr(runtime, "REDIS", None)
+    if r0 is not None:
+        token = uuid.uuid4().hex
+
+        try:
+            ok = await r0.set(POLLING_LOCK_KEY, token, nx=True, ex=POLLING_LOCK_TTL_SECONDS)
+        except Exception:
+            logging.exception("⚠️ polling-guard: Redis SET failed -> fallback to file lock")
+            ok = None
+
+        if ok:
+            logging.info("✅ polling-guard: Redis lock acquired")
+
+            async def _renew_loop():
+                try:
+                    while True:
+                        await asyncio.sleep(POLLING_LOCK_RENEW_EVERY_SECONDS)
+
+                        r = getattr(runtime, "REDIS", None)
+                        if r is None:
+                            logging.error("⛔ polling-guard: Redis is None (lost connection). Stopping polling.")
+                            with contextlib.suppress(Exception):
+                                await dp.stop_polling()
+                            return
+
+                        try:
+                            cur = await r.get(POLLING_LOCK_KEY)
+                            if cur != token:
+                                logging.error("⛔ polling-guard: Redis lock lost (token mismatch). Stopping polling.")
+                                with contextlib.suppress(Exception):
+                                    await dp.stop_polling()
+                                return
+
+                            await r.expire(POLLING_LOCK_KEY, POLLING_LOCK_TTL_SECONDS)
+
+                        except Exception:
+                            logging.exception("⚠️ polling-guard: Redis renew failed. Stopping polling to avoid split-brain.")
+                            with contextlib.suppress(Exception):
+                                await dp.stop_polling()
+                            return
+
+                except asyncio.CancelledError:
+                    return
+
+            renew_task = asyncio.create_task(_renew_loop())
+
+            async def _release():
+                r = getattr(runtime, "REDIS", None)
+                if r is None:
+                    return
+                try:
+                    lua = """
+                    if redis.call('GET', KEYS[1]) == ARGV[1] then
+                        return redis.call('DEL', KEYS[1])
+                    else
+                        return 0
+                    end
+                    """
+                    await r.eval(lua, 1, POLLING_LOCK_KEY, token)
+                except Exception:
+                    pass
+
+            return _release, renew_task
+
+        logging.error("⛔ polling-guard: another bot instance is already polling (Redis lock exists)")
+        raise SystemExit(2)
+
+    os.makedirs("run", exist_ok=True)
+    lock_path = os.path.join("run", "findexhub_polling.lock")
+
+    try:
+        import fcntl  # mac/linux
+
+        f = open(lock_path, "w")
+        try:
+            fcntl.flock(f.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            logging.error("⛔ polling-guard: another bot instance is already polling (file lock exists)")
+            f.close()
+            raise SystemExit(2)
+
+        f.write(str(os.getpid()))
+        f.flush()
+
+        logging.info("✅ polling-guard: file lock acquired")
+
+        async def _release():
+            try:
+                try:
+                    fcntl.flock(f.fileno(), fcntl.LOCK_UN)
+                except Exception:
+                    pass
+                try:
+                    f.close()
+                except Exception:
+                    pass
+            finally:
+                try:
+                    os.remove(lock_path)
+                except Exception:
+                    pass
+
+        return _release, None
+
+    except Exception:
+        logging.exception("⚠️ polling-guard: file lock failed")
+        raise
+
+
+def build_bot() -> Bot:
+    session = AiohttpSession(timeout=180)
+    return Bot(
+        token=config.bot_token,
+        session=session,
+        default=DefaultBotProperties(
+            parse_mode=ParseMode.HTML,
+            link_preview_is_disabled=True,
+        ),
+    )
+
+
+# ---------------- REDIS INIT ----------------
+async def _init_redis():
+    try:
+        import redis.asyncio as redis  # type: ignore
+    except Exception:
+        runtime.REDIS = None
+        runtime.REDIS_URL = None
+        logging.warning("⚠️ redis package not installed -> alerts/responds will use in-memory fallback where possible")
+        return
+
+    redis_url = _build_redis_url()
+    runtime.REDIS_URL = redis_url
+
+    try:
+        r = redis.from_url(redis_url, decode_responses=True)
+        await r.ping()
+        runtime.REDIS = r
+        logging.info("✅ Redis connected")
+    except Exception:
+        runtime.REDIS = None
+        logging.exception("⚠️ Redis not available -> alerts/responds will use fallback where possible")
+
+
+async def _close_redis():
+    try:
+        r = getattr(runtime, "REDIS", None)
+        await _maybe_close_redis_client(r)
+    finally:
+        runtime.REDIS = None
+
+
+async def _redis_reconnect_once() -> bool:
+    try:
+        import redis.asyncio as redis  # type: ignore
+    except Exception:
+        return False
+
+    redis_url = getattr(runtime, "REDIS_URL", None) or _build_redis_url()
+    runtime.REDIS_URL = redis_url
+
+    try:
+        r = redis.from_url(redis_url, decode_responses=True)
+        await r.ping()
+
+        old = getattr(runtime, "REDIS", None)
+        runtime.REDIS = r
+
+        if old is not None and old is not r:
+            with contextlib.suppress(Exception):
+                await _maybe_close_redis_client(old)
+
+        logging.info("✅ Redis reconnected")
+        return True
+    except Exception:
+        return False
+
+
+async def _redis_health_loop():
+    try:
+        while True:
+            await asyncio.sleep(REDIS_HEALTHCHECK_EVERY_SECONDS)
+
+            r = getattr(runtime, "REDIS", None)
+            if r is None:
+                ok = await _redis_reconnect_once()
+                if not ok:
+                    await asyncio.sleep(REDIS_RECONNECT_BACKOFF_SECONDS)
+                continue
+
+            try:
+                await r.ping()
+            except Exception:
+                logging.warning("⚠️ Redis ping failed -> switching to fallback + trying reconnect")
+                with contextlib.suppress(Exception):
+                    await _maybe_close_redis_client(r)
+                runtime.REDIS = None
+
+                ok = await _redis_reconnect_once()
+                if not ok:
+                    await asyncio.sleep(REDIS_RECONNECT_BACKOFF_SECONDS)
+
+    except asyncio.CancelledError:
+        return
+
+
+async def main():
+    bot = build_bot()
+
+    await _init_redis()
+    dp = Dispatcher(storage=RedisStorage(redis=runtime.REDIS))
+    redis_health_task = asyncio.create_task(_redis_health_loop())
+
+    release_guard = None
+    renew_task = None
+    try:
+        release_guard, renew_task = await _acquire_polling_guard(dp)
+    except SystemExit:
+        try:
+            redis_health_task.cancel()
+            with contextlib.suppress(Exception):
+                await redis_health_task
+        finally:
+            try:
+                await _close_redis()
+            finally:
+                with contextlib.suppress(Exception):
+                    await bot.session.close()
+        return
+
+    try:
+        me = await bot.get_me()
+        runtime.BOT_USERNAME = (me.username or "").lstrip("@").strip() or None
+        logging.info(f"✅ BOT_USERNAME = @{runtime.BOT_USERNAME}" if runtime.BOT_USERNAME else "⚠️ BOT_USERNAME is empty")
+    except Exception:
+        runtime.BOT_USERNAME = (os.getenv("BOT_USERNAME") or "").lstrip("@").strip() or None
+        logging.exception("⚠️ bot.get_me failed -> BOT_USERNAME fallback from env")
+
+    try:
+        await bot.delete_webhook(drop_pending_updates=True)
+        logging.info("✅ Webhook deleted (drop_pending_updates=True)")
+    except Exception:
+        logging.exception("⚠️ delete_webhook failed")
+
+    # ---------------- MIDDLEWARES ----------------
+    dp.callback_query.middleware(CallbackLoggerMiddleware())
+    dp.message.middleware(SavedHintMiddleware())
+    dp.callback_query.middleware(PublishedPreviewGuardMiddleware())
+
+    sub = SubscriptionMiddleware()
+    dp.message.middleware(sub)
+    dp.callback_query.middleware(sub)
+
+    fsm_wd = FSMWatchdogMiddleware()
+    dp.message.middleware(fsm_wd)
+    dp.callback_query.middleware(fsm_wd)
+
+    # ---------------- ROUTERS ----------------
+    dp.include_router(fsm_watchdog_router)
+    dp.include_router(help_router)
+    dp.include_router(menu_router)
+    dp.include_router(system_admin_router)
+
+    dp.include_router(deeplink_router)
+    dp.include_router(inline_share_router)
+
+    dp.include_router(alerts_router)
+    dp.include_router(diagnostics_router)
+    dp.include_router(start_router)
+
+    dp.include_router(forms_router)
+    dp.include_router(moderation_router)
+
+    dp.include_router(employer_router)
+    dp.include_router(seeker_router)
+    dp.include_router(replies_router)
+    dp.include_router(responds_router)
+
+    dp.include_router(subscription_router)
+    dp.include_router(debug_ping_router)
+
+    logging.info("✅ Bot started (polling)")
+
+    try:
+        await dp.start_polling(
+            bot,
+            polling_timeout=20,
+            allowed_updates=dp.resolve_used_update_types(),
+        )
+    finally:
+        with contextlib.suppress(Exception):
+            redis_health_task.cancel()
+            await redis_health_task
+
+        with contextlib.suppress(Exception):
+            if renew_task is not None:
+                renew_task.cancel()
+                with contextlib.suppress(Exception):
+                    await renew_task
+
+        with contextlib.suppress(Exception):
+            if release_guard is not None:
+                await release_guard()
+
+        await _close_redis()
+        with contextlib.suppress(Exception):
+            await bot.session.close()
+
+
+if __name__ == "__main__":
+    asyncio.run(main())

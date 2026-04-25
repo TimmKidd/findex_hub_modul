@@ -1,0 +1,7 @@
+NAMES                          IMAGE                       STATUS
+findex-local-test-support-1    findex-local-test-support   Up 6 hours
+findex-local-test-bot-1        findex-local-test-bot       Up 30 minutes
+findex-local-test-postgres-1   postgres:16                 Up 11 hours
+findex-local-test-redis-1      redis:7-alpine              Up 11 hours
+findex_pg                      postgres:16                 Up 3 weeks (healthy)
+findex_redis                   redis:7-alpine              Up 3 weeks (healthy)
