@@ -1620,8 +1620,9 @@ def author_card_kb(
             [InlineKeyboardButton(text="❌ Отклонить кандидата", callback_data=f"{CB_AUTHOR_REJECT}:{respond_id}")],
         ])
     else:
+        author_reply_text = "💬 Начать диалог" if st == ST_INVITED else "✉️ Ответить"
         rows.extend([
-            [InlineKeyboardButton(text="✉️ Ответить", callback_data=f"{CB_AUTHOR_REPLY}:{respond_id}")],
+            [InlineKeyboardButton(text=author_reply_text, callback_data=f"{CB_AUTHOR_REPLY}:{respond_id}")],
             [InlineKeyboardButton(text="🚫 Закрыть отклик", callback_data=f"{CB_AUTHOR_CLOSE}:{respond_id}")],
         ])
 
