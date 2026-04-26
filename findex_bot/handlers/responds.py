@@ -2123,11 +2123,6 @@ async def toggle_card(cb: CallbackQuery, redis: Any = None):
         repo = RespondRepo(session)
 
         r: Respond | None = await session.get(Respond, int(respond_id))
-        logger.warning(
-            cb.from_user.id,
-            respond_id,
-            bool(r),
-        )
         if not r:
             return await safe_answer(cb, "❌ Отклик не найден", alert=True)
 
