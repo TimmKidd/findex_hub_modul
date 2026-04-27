@@ -1,5 +1,12 @@
+x-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "5"
+
 services:
   postgres:
+    logging: *default-logging
     image: postgres:16
     restart: unless-stopped
     environment:
@@ -10,11 +17,13 @@ services:
       - postgres_data:/var/lib/postgresql/data
 
   redis:
+    logging: *default-logging
     image: redis:7-alpine
     restart: unless-stopped
     command: sh -c "redis-server --appendonly yes --requirepass ${REDIS_PASSWORD}"
 
   bot:
+    logging: *default-logging
     build:
       context: /Users/tmkd/Desktop/tmkd/FindexHub
       dockerfile: Dockerfile
@@ -33,6 +42,7 @@ services:
       - redis
 
   jobs:
+    logging: *default-logging
     restart: unless-stopped
     build:
       context: /Users/tmkd/Desktop/tmkd/FindexHub
@@ -45,6 +55,7 @@ services:
       - redis
 
   resurrection:
+    logging: *default-logging
     restart: unless-stopped
     build:
       context: /Users/tmkd/Desktop/tmkd/FindexHub
@@ -57,6 +68,7 @@ services:
       - redis
 
   support:
+    logging: *default-logging
     restart: unless-stopped
     build:
       context: /Users/tmkd/Desktop/tmkd/FindexHub
