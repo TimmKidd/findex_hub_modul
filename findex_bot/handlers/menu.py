@@ -661,7 +661,7 @@ def _responds_bucket_text(side: str, bucket: str, page: int, total: int, items: 
                 "Пока откликов нет\n\n"
                 "⚡ Кандидаты появляются сразу после публикации\n"
                 "Начни получать отклики уже сегодня\n\n"
-                "Размести вакансию 👇"
+                "Размести вакансию /start"
             )
 
     start_idx = page * RESPONDS_PAGE_SIZE + 1
