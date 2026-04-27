@@ -1,271 +1,1166 @@
-from aiogram import Router, F
-from aiogram.types import (
-    Message,
-    CallbackQuery,
-    InlineKeyboardMarkup,
-    InlineKeyboardButton,
-    ReplyKeyboardRemove,
-)
-from aiogram.enums import ParseMode
-from aiogram.fsm.context import FSMContext
+# findex_bot/handlers/employer.py
+from __future__ import annotations
 
+import logging
+import os
+from typing import Any
+
+from aiogram import Router, F
+from aiogram.filters import StateFilter
+from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
+from aiogram.fsm.context import FSMContext
+from aiogram.enums import ParseMode
+
+import findex_bot.runtime as runtime
+from findex_bot.db.db import get_sessionmaker
+from findex_bot.db.repo import AdRepo
+from findex_bot.handlers.shared_metro_flow import (
+    edit_metro_card as shared_edit_metro_card,
+    metro_close as shared_metro_close,
+    metro_pick as shared_metro_pick,
+    metro_line_pick as shared_metro_line_pick,
+)
+from findex_bot.handlers.shared_preview_refs import (
+    cleanup_after_preview as shared_cleanup_after_preview,
+    persist_preview_ref as shared_persist_preview_ref,
+)
+from findex_bot.db.daily_limits import get_count as db_get_pub_count
 from findex_bot.states.vacancies import EmployerForm
-from findex_bot.utils.vacancy_utils import is_valid_city_input
+from findex_bot.utils.vacancy_utils import get_ad_text
+from findex_bot.utils.validators import (
+    validate_required,
+    validate_description,
+    validate_salary,
+    validate_location_letters_only,
+    validate_contacts,
+    validate_no_profanity,
+    normalize_title,
+    normalize_sentence,
+)
 from findex_bot.utils.ui_utils import (
-    send_preview,
-    filter_field_mat,
+    safe_answer,
+    employer_preview_keyboard,
+    moderation_keyboard,
+    employer_media_choice_kb,
+    media_confirm_kb,
+    sent_to_moderation_stub_kb,
+    media_confirmed_stub_kb,
+    MEDIA_CONFIRMED_CALLBACK,
+    NOOP_CALLBACK,
+    DAILY_FREE_LIMIT,
+    is_unlimited,
+    utc_seconds_to_reset,
+    format_hhmmss,
+    contact_mode_info_text,
+    CB_CONTACT_MODE_SET,
+    CB_CONTACT_MODE_INFO,
+    CONTACT_MODE_CONTACTS,
+    CONTACT_MODE_BOT,
+    CONTACT_MODE_BOTH,
+    track_cleanup_message,
+    track_cleanup_messages,
+    cleanup_tracked_messages,
+    reset_cleanup_bucket,
+    replace_step_prompt,
+    replace_step_error,
+    clear_step_error,
+    clear_step_prompt,
+    delete_user_input_message,
+)
+from findex_bot.utils.moscow_metro import (
+    METRO_PICK_CALLBACK,
+    METRO_LINE_CALLBACK,
+    METRO_STATION_CALLBACK,
+    METRO_CLOSE_CALLBACK,
+    metro_location_prompt,
+    metro_location_keyboard,
+    metro_lines_keyboard,
+    metro_stations_keyboard,
+    resolve_station,
+    build_moscow_location,
+    validate_location_input,
+    normalize_location_input,
+)
+
+logger = logging.getLogger(__name__)
+from findex_bot.utils.hints_registry import (
+    VACANCY_CONTACT_MODE_TRASH,
+    VACANCY_MEDIA_CHOICE_TRASH,
+    VACANCY_MEDIA_CONFIRM_TRASH,
+    VACANCY_ON_MODERATION_TRASH,
+    VACANCY_PREVIEW_TRASH,
+    get_hint_text,
 )
 
 router = Router()
 
+K_PENDING_MEDIA = "pending_media"
+K_EDIT_MODE = "edit_mode"
+K_PREVIEW_MSG_ID = "preview_msg_id"
+K_PREVIEW_IS_MEDIA = "preview_is_media"
 
-# ---------- РАБОТОДАТЕЛЬ ----------
+EMPLOYER_MAX_VIDEO_SECONDS = 15
+EMPLOYER_MAX_VIDEO_SIZE_BYTES = 5 * 1024 * 1024  # 5 MB
+
+
+
+def _trash_buttons_only_notice() -> str:
+    return "ℹ️ Сейчас вводить текст не нужно — используй кнопки ниже."
+
+def _contact_mode_keyboard_2(ad_id: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="🔒 Отклики через бота (рекомендовано)", callback_data=f"{CB_CONTACT_MODE_SET}:{int(ad_id)}:{CONTACT_MODE_BOT}")],
+            [InlineKeyboardButton(text="📞 Контакты в объявлении (без бота)", callback_data=f"{CB_CONTACT_MODE_SET}:{int(ad_id)}:{CONTACT_MODE_CONTACTS}")],
+            [InlineKeyboardButton(text="ℹ️ Что это значит?", callback_data=f"{CB_CONTACT_MODE_INFO}:{int(ad_id)}")],
+        ]
+    )
+
+
+def _get_primary_photo_id(payload: dict[str, Any] | None) -> str | None:
+    p = payload or {}
+
+    one = p.get("photo_file_id")
+    if one:
+        s = str(one).strip()
+        if s:
+            return s
+
+    raw = p.get("photo_file_ids")
+    if isinstance(raw, list):
+        for x in raw:
+            s = str(x).strip()
+            if s:
+                return s
+
+    return None
+
+
+@router.callback_query(F.data == NOOP_CALLBACK)
+async def _noop(cb: CallbackQuery):
+    await safe_answer(cb)
+
+
+@router.callback_query(F.data == MEDIA_CONFIRMED_CALLBACK)
+async def _media_confirmed_stub(cb: CallbackQuery):
+    await safe_answer(
+        cb,
+        "🟢 Медиа подтверждено.\n\nЕсли хочешь заменить — открой предпросмотр объявления и нажми кнопку «Медиа».",
+        alert=True,
+    )
+
+
+def _parse_id(cbdata: str) -> int:
+    return int((cbdata or "").split(":")[1])
+
+
+def _is_edit_mode(data: dict) -> bool:
+    return bool(data.get(K_EDIT_MODE))
+
+
+def _get_moderation_chat_id() -> int:
+    val = getattr(runtime, "MODERATION_CHAT_ID", None)
+    if val:
+        return int(val)
+
+    cfg = getattr(runtime, "CONFIG", None)
+    if cfg is not None and getattr(cfg, "moderation_chat_id", 0):
+        return int(cfg.moderation_chat_id)
+
+    envv = os.getenv("MODERATION_CHAT_ID")
+    if envv:
+        return int(envv)
+
+    raise RuntimeError("MODERATION_CHAT_ID is not configured")
+
+
+def _get_thread_vacancies() -> int:
+    val = getattr(runtime, "THREAD_VACANCIES", None)
+    try:
+        v = int(val or 0)
+    except Exception:
+        v = 0
+    if v:
+        return v
+
+    envv = os.getenv("THREAD_VACANCIES")
+    try:
+        return int(envv or 0)
+    except Exception:
+        return 0
+
+
+def _moderation_user_footer(cb: CallbackQuery) -> str:
+    u = cb.from_user
+    uname = f"@{u.username}" if u.username else "—"
+    full = " ".join([x for x in [u.first_name, u.last_name] if x]) or "—"
+
+    return (
+        "\n\n"
+        f"Автор: {uname}\n"
+        f"Telegram ID: <code>{u.id}</code>\n"
+        f"Имя: {full}"
+    )
+
+
+async def _need_restart(message_or_cb: Message | CallbackQuery) -> None:
+    text = "⚠️ Сессия сбилась. Нажми /start."
+    try:
+        if isinstance(message_or_cb, Message):
+            await message_or_cb.answer(text)
+        else:
+            await safe_answer(message_or_cb, text, alert=True)
+            if message_or_cb.message:
+                await message_or_cb.message.answer(text)
+            else:
+                await message_or_cb.bot.send_message(message_or_cb.from_user.id, text)
+    except Exception:
+        logger.exception("PREVIEW_AUDIT employer crash ad_id=%s chat_id=%s prev_msg_id=%s", ad_id, chat_id, prev_msg_id)
+
+
+def _prompt_title() -> str:
+    return "Укажи 👤 должность.\n\nПример: Бариста, Официант, Администратор"
+
+
+def _prompt_salary() -> str:
+    return "Укажи 💲 зарплату.\n\nПример: от 80 000, 120 000, по договорённости"
+
+
+def _prompt_location() -> str:
+    return metro_location_prompt()
+
+
+def _prompt_contacts() -> str:
+    return (
+        "Укажи 📞 контакты.\n\n"
+        "ℹ️ Подсказка по контактам:\n"
+        "• Telegram: @username\n"
+        "• Телефон: +7 999 123-45-67\n"
+        "• Email: name@mail.com\n"
+        "• Любой удобный способ связи"
+    )
+
+
+def _prompt_description() -> str:
+    return "Укажи 📝 описание.\n\nПример: обязанности, условия, требования (до 2000 символов)"
+
+
+def _prompt_contact_mode() -> str:
+    return "Как принимать отклики?"
+
+
+async def _published_today(user_id: int) -> int:
+    try:
+        async with get_sessionmaker()() as session:
+            v = await db_get_pub_count(session, int(user_id))
+            await session.commit()
+            return int(v)
+    except Exception:
+        return 0
+
+
+def _limit_block_text(published: int) -> str:
+    left = format_hhmmss(utc_seconds_to_reset())
+    return (
+        f"⛔ Дневной лимит публикаций исчерпан ({published}/{DAILY_FREE_LIMIT}).\n"
+        f"До сброса (UTC): {left}"
+    )
+
+
+def _sanitize_moderation_text(text: str) -> str:
+    if not text:
+        return text
+    bad_markers = ("⛔ Дневной лимит публикаций исчерпан", "До сброса (UTC):")
+    lines = (text or "").splitlines()
+    cleaned: list[str] = []
+    for ln in lines:
+        if any(m in ln for m in bad_markers):
+            continue
+        cleaned.append(ln)
+    out = "\n".join(cleaned).strip()
+    return out if out else text
+
+
+async def _cleanup_after_preview(
+    bot,
+    state: FSMContext,
+    preview_msg_id: int | None,
+    previous_preview_msg_id: int | None = None,
+) -> None:
+    await shared_cleanup_after_preview(
+        bot=bot,
+        state=state,
+        preview_msg_id=preview_msg_id,
+        previous_preview_msg_id=previous_preview_msg_id,
+    )
+
+
+async def _upsert_preview(bot, chat_id: int, state: FSMContext, ad_id: int) -> None:
+    data = await state.get_data()
+    state_prev_msg_id = data.get(K_PREVIEW_MSG_ID)
+    state_prev_is_media = bool(data.get(K_PREVIEW_IS_MEDIA))
+
+    async with get_sessionmaker()() as session:
+        ad = await AdRepo(session).get(ad_id)
+        if not ad:
+            return
+
+        payload = dict(ad.payload or {})
+        text = get_ad_text(ad)
+        photo_id = _get_primary_photo_id(payload)
+        video_id = payload.get("video_file_id")
+
+        payload_prev_msg_id = int(payload.get("preview_message_id") or 0) or None
+        payload_prev_is_media = bool(payload.get("preview_is_media"))
+
+    prev_candidates = []
+    for raw_id in (payload_prev_msg_id, state_prev_msg_id):
+        try:
+            v = int(raw_id or 0)
+            if v > 0 and v not in prev_candidates:
+                prev_candidates.append(v)
+        except Exception:
+            pass
+
+    prev_msg_id = prev_candidates[0] if prev_candidates else None
+    prev_is_media = state_prev_is_media if state_prev_msg_id else payload_prev_is_media
+    has_media = bool(photo_id or video_id)
+
+    async def _persist_preview_ref(message_id: int, is_media: bool) -> None:
+        await shared_persist_preview_ref(
+            state=state,
+            ad_id=ad_id,
+            chat_id=chat_id,
+            message_id=message_id,
+            is_media=is_media,
+            k_preview_msg_id=K_PREVIEW_MSG_ID,
+            k_preview_is_media=K_PREVIEW_IS_MEDIA,
+        )
+
+    if prev_msg_id:
+        if has_media and prev_is_media:
+            try:
+                await bot.edit_message_caption(
+                    chat_id=chat_id,
+                    message_id=int(prev_msg_id),
+                    caption=text,
+                    reply_markup=employer_preview_keyboard(ad_id),
+                )
+                await _persist_preview_ref(int(prev_msg_id), True)
+                await _cleanup_after_preview(bot, state, int(prev_msg_id), int(prev_msg_id))
+                return
+            except Exception as e:
+                logger.warning(
+                    "PREVIEW_EDIT_FAIL ad_id=%s prev_msg_id=%s has_media=%s prev_is_media=%s err=%r",
+                    ad_id, prev_msg_id, has_media, prev_is_media, e,
+                )
+
+        if (not has_media) and (not prev_is_media):
+            try:
+                await bot.edit_message_text(
+                    chat_id=chat_id,
+                    message_id=int(prev_msg_id),
+                    text=text,
+                    reply_markup=employer_preview_keyboard(ad_id),
+                )
+                await _persist_preview_ref(int(prev_msg_id), False)
+                await _cleanup_after_preview(bot, state, int(prev_msg_id), int(prev_msg_id))
+                return
+            except Exception as e:
+                logger.warning(
+                    "PREVIEW_EDIT_FAIL ad_id=%s prev_msg_id=%s has_media=%s prev_is_media=%s err=%r",
+                    ad_id, prev_msg_id, has_media, prev_is_media, e,
+                )
+
+        for stale_id in prev_candidates:
+            try:
+                await bot.delete_message(chat_id=chat_id, message_id=int(stale_id))
+            except Exception as e:
+                logger.warning(
+                    "PREVIEW_DELETE_FAIL ad_id=%s prev_msg_id=%s has_media=%s prev_is_media=%s err=%r",
+                    ad_id, stale_id, has_media, prev_is_media, e,
+                )
+
+    if has_media:
+        if video_id:
+            msg = await bot.send_video(
+                chat_id=chat_id,
+                video=video_id,
+                caption=text,
+                reply_markup=employer_preview_keyboard(ad_id),
+            )
+        else:
+            msg = await bot.send_photo(
+                chat_id=chat_id,
+                photo=photo_id,
+                caption=text,
+                reply_markup=employer_preview_keyboard(ad_id),
+            )
+        await _persist_preview_ref(int(msg.message_id), True)
+        await _cleanup_after_preview(bot, state, int(msg.message_id), prev_msg_id)
+        return
+
+    msg = await bot.send_message(
+        chat_id=chat_id,
+        text=text,
+        reply_markup=employer_preview_keyboard(ad_id),
+    )
+    await _persist_preview_ref(int(msg.message_id), False)
+    await _cleanup_after_preview(bot, state, int(msg.message_id), prev_msg_id)
+
+
+async def _after_field_saved(message: Message, state: FSMContext, ad_id: int, next_state, next_prompt: str, reply_markup=None) -> None:
+    data = await state.get_data()
+
+    await clear_step_error(message.bot, state, chat_id=int(message.chat.id))
+
+    if _is_edit_mode(data):
+        await state.update_data(**{K_EDIT_MODE: False})
+        await state.set_state(EmployerForm.preview)
+        await _upsert_preview(message.bot, message.chat.id, state, ad_id)
+        return
+
+    await state.set_state(next_state)
+    await replace_step_prompt(
+        message.bot,
+        state,
+        chat_id=int(message.chat.id),
+        text=next_prompt,
+        reply_markup=reply_markup,
+    )
+
 
 @router.callback_query(F.data == "vac_employer")
-async def employer_start(callback: CallbackQuery, state: FSMContext):
+async def employer_entry(cb: CallbackQuery, state: FSMContext):
+    await safe_answer(cb)
     await state.clear()
+    await reset_cleanup_bucket(state)
 
-    username = callback.from_user.username
-    author = f"@{username}" if username else f"id{callback.from_user.id}"
+    async with get_sessionmaker()() as session:
+        repo = AdRepo(session)
+        ad = await repo.get_or_create_draft(author_user_id=cb.from_user.id, role="employer")
+        await repo.patch_payload(ad.id, role="employer", author_id=cb.from_user.id, contact_mode=None)
 
-    await state.update_data(
-        position="",
-        salary="",
-        location="",
-        contacts="",
-        description="",
-        media_type=None,
-        media_id=None,
-        role="Работодатель",
-        author_id=callback.from_user.id,
-        author=author,
-        is_inline_edit=False,
-        force_preview=False,    # ✅ ключевой флаг для возврата в предпросмотр
-        on_moderation=False,    # ✅ защита от повторной отправки
+    await state.update_data(ad_id=ad.id, preview_msg_id=None, preview_is_media=False, edit_mode=False)
+    await state.set_state(EmployerForm.title)
+
+    await replace_step_prompt(
+        cb.bot,
+        state,
+        chat_id=int(cb.from_user.id),
+        text=_prompt_title(),
     )
 
-    await state.set_state(EmployerForm.position)
-    await callback.message.answer(
-        "Работодатель\n\nУкажи 👤 должность.\n"
-        "<i>Пример: Бармен, Официант, Администратор</i>",
-        parse_mode=ParseMode.HTML,
-        reply_markup=ReplyKeyboardRemove(),
-    )
-    await callback.answer()
 
-
-# ---------- INLINE EDIT (Employer) ----------
-
-@router.callback_query(F.data == "emp_edit_position")
-async def emp_edit_position(callback: CallbackQuery, state: FSMContext):
-    await state.update_data(is_inline_edit=True, force_preview=False)
-    await state.set_state(EmployerForm.position)
-    await callback.message.answer(
-        "✏️ Редактирование: 👤 Должность\n<i>Пример: Бармен, Официант, Администратор</i>",
-        parse_mode=ParseMode.HTML,
-    )
-    await callback.answer()
-
-
-@router.callback_query(F.data == "emp_edit_salary")
-async def emp_edit_salary(callback: CallbackQuery, state: FSMContext):
-    await state.update_data(is_inline_edit=True, force_preview=False)
-    await state.set_state(EmployerForm.salary)
-    await callback.message.answer(
-        "✏️ Редактирование: 💲 Зарплата\n<i>Пример: 120000, до 200000, от 80k, по договорённости</i>",
-        parse_mode=ParseMode.HTML,
-    )
-    await callback.answer()
-
-
-@router.callback_query(F.data == "emp_edit_location")
-async def emp_edit_location(callback: CallbackQuery, state: FSMContext):
-    await state.update_data(is_inline_edit=True, force_preview=False)
-    await state.set_state(EmployerForm.location)
-    await callback.message.answer(
-        "✏️ Редактирование: 📍 Локация\n<i>Пример: Москва, Санкт-Петербург, Дистанционно</i>",
-        parse_mode=ParseMode.HTML,
-    )
-    await callback.answer()
-
-
-@router.callback_query(F.data == "emp_edit_contacts")
-async def emp_edit_contacts(callback: CallbackQuery, state: FSMContext):
-    await state.update_data(is_inline_edit=True, force_preview=False)
-    await state.set_state(EmployerForm.contacts)
-    await callback.message.answer(
-        "✏️ Редактирование: ☎️ Контакты\n<i>Пример: @username, email@example.com, +7 777 1234567</i>",
-        parse_mode=ParseMode.HTML,
-    )
-    await callback.answer()
-
-
-@router.callback_query(F.data == "emp_edit_description")
-async def emp_edit_description(callback: CallbackQuery, state: FSMContext):
-    await state.update_data(is_inline_edit=True, force_preview=False)
-    await state.set_state(EmployerForm.description)
-    await callback.message.answer(
-        "✏️ Редактирование: 📝 Описание\n<i>Опиши вакансию (до 2000 символов)</i>",
-        parse_mode=ParseMode.HTML,
-    )
-    await callback.answer()
-
-
-# ---------- ПОЛЯ ----------
-
-@router.message(EmployerForm.position)
-async def employer_position(message: Message, state: FSMContext):
-    if not await filter_field_mat(message, "position"):
-        return
-
-    txt = (message.text or "").strip()
-    await state.update_data(position=txt)
-
+@router.message(EmployerForm.title)
+async def emp_title(message: Message, state: FSMContext):
     data = await state.get_data()
-    if data.get("is_inline_edit") or data.get("force_preview"):
-        # ✅ после исправления/редактирования — сразу предпросмотр
-        await state.update_data(is_inline_edit=False, force_preview=False, on_moderation=False)
-        await state.set_state(EmployerForm.preview)
-        await send_preview(message, state, message.bot)
+    ad_id = data.get("ad_id")
+    if not ad_id:
+        await _need_restart(message)
         return
 
-    await state.set_state(EmployerForm.salary)
-    await message.answer(
-        "Укажи 💲 зарплату.\n"
-        "<i>Пример: 120000, до 200000, от 80k, по договорённости</i>",
-        parse_mode=ParseMode.HTML,
-    )
+    await track_cleanup_message(state, message)
+
+    val = (message.text or "").strip()
+    err = validate_required(val, "Должность") or validate_no_profanity(val)
+    if err:
+        await replace_step_error(
+            message.bot,
+            state,
+            chat_id=int(message.chat.id),
+            text=err,
+        )
+        return
+
+    val = normalize_title(val)
+    async with get_sessionmaker()() as session:
+        await AdRepo(session).patch_payload(int(ad_id), title=val)
+
+    await _after_field_saved(message, state, int(ad_id), EmployerForm.salary, _prompt_salary())
 
 
 @router.message(EmployerForm.salary)
-async def employer_salary(message: Message, state: FSMContext):
-    if not await filter_field_mat(message, "salary"):
-        return
-
-    txt = (message.text or "").strip()
-    await state.update_data(salary=txt)
-
+async def emp_salary(message: Message, state: FSMContext):
     data = await state.get_data()
-    if data.get("is_inline_edit") or data.get("force_preview"):
-        await state.update_data(is_inline_edit=False, force_preview=False, on_moderation=False)
-        await state.set_state(EmployerForm.preview)
-        await send_preview(message, state, message.bot)
+    ad_id = data.get("ad_id")
+    if not ad_id:
+        await _need_restart(message)
         return
 
-    await state.set_state(EmployerForm.location)
-    await message.answer(
-        "Укажи 📍 локацию.\n"
-        "<i>Пример: Москва, Санкт-Петербург, Дистанционно</i>",
-        parse_mode=ParseMode.HTML,
-    )
+    await track_cleanup_message(state, message)
+
+    val = (message.text or "").strip()
+    err = validate_required(val, "Зарплата") or validate_no_profanity(val) or validate_salary(val)
+    if err:
+        await replace_step_error(
+            message.bot,
+            state,
+            chat_id=int(message.chat.id),
+            text=err,
+        )
+        return
+
+    async with get_sessionmaker()() as session:
+        await AdRepo(session).patch_payload(int(ad_id), salary=val)
+
+    await _after_field_saved(message, state, int(ad_id), EmployerForm.location, _prompt_location(), reply_markup=metro_location_keyboard())
 
 
 @router.message(EmployerForm.location)
-async def employer_location(message: Message, state: FSMContext):
-    if not await filter_field_mat(message, "location"):
-        return
-
-    txt = (message.text or "").strip()
-
-    if not is_valid_city_input(txt):
-        await message.answer("В названии города разрешены только буквы, пробелы и тире.")
-        return
-
-    await state.update_data(location=txt)
-
+async def emp_location(message: Message, state: FSMContext):
     data = await state.get_data()
-    if data.get("is_inline_edit") or data.get("force_preview"):
-        await state.update_data(is_inline_edit=False, force_preview=False, on_moderation=False)
-        await state.set_state(EmployerForm.preview)
-        await send_preview(message, state, message.bot)
+    ad_id = data.get("ad_id")
+    if not ad_id:
+        await _need_restart(message)
         return
 
-    await state.set_state(EmployerForm.contacts)
-    await message.answer(
-        "Укажи ☎️ контакты.\n"
-        "<i>Пример: @username, email@example.com, +7 777 1234567</i>",
-        parse_mode=ParseMode.HTML,
-    )
+    await track_cleanup_message(state, message)
+
+    val = (message.text or "").strip()
+    err = validate_required(val, "Локация") or validate_no_profanity(val) or validate_location_input(val)
+    if err:
+        await replace_step_error(
+            message.bot,
+            state,
+            chat_id=int(message.chat.id),
+            text=err,
+        )
+        return
+
+    val = normalize_location_input(val)
+    async with get_sessionmaker()() as session:
+        await AdRepo(session).patch_payload(int(ad_id), location=val)
+
+    await _after_field_saved(message, state, int(ad_id), EmployerForm.contacts, _prompt_contacts())
 
 
 @router.message(EmployerForm.contacts)
-async def employer_contacts(message: Message, state: FSMContext):
-    if not await filter_field_mat(message, "contacts"):
-        return
-
-    txt = (message.text or "").strip()
-    await state.update_data(contacts=txt)
-
+async def emp_contacts(message: Message, state: FSMContext):
     data = await state.get_data()
-    if data.get("is_inline_edit") or data.get("force_preview"):
-        await state.update_data(is_inline_edit=False, force_preview=False, on_moderation=False)
-        await state.set_state(EmployerForm.preview)
-        await send_preview(message, state, message.bot)
+    ad_id = data.get("ad_id")
+    if not ad_id:
+        await _need_restart(message)
         return
 
-    await state.set_state(EmployerForm.description)
-    await message.answer(
-        "Опиши 📝 вакансию (до 2000 символов).",
-        parse_mode=ParseMode.HTML,
-    )
+    await track_cleanup_message(state, message)
+
+    val = (message.text or "").strip()
+    err = validate_required(val, "Контакты") or validate_no_profanity(val) or validate_contacts(val)
+    if err:
+        await replace_step_error(
+            message.bot,
+            state,
+            chat_id=int(message.chat.id),
+            text=err,
+        )
+        return
+
+    async with get_sessionmaker()() as session:
+        await AdRepo(session).patch_payload(int(ad_id), contacts=val)
+
+    await _after_field_saved(message, state, int(ad_id), EmployerForm.description, _prompt_description())
 
 
 @router.message(EmployerForm.description)
-async def employer_description(message: Message, state: FSMContext):
-    if not await filter_field_mat(message, "description"):
+async def emp_description(message: Message, state: FSMContext):
+    data = await state.get_data()
+    ad_id = data.get("ad_id")
+    if not ad_id:
+        await _need_restart(message)
         return
 
-    description = (message.text or "").strip()
+    await track_cleanup_message(state, message)
 
-    if len(description) < 10:
-        await message.answer("Описание слишком короткое!")
+    val = (message.text or "").strip()
+    err = validate_required(val, "Описание") or validate_no_profanity(val) or validate_description(val)
+    if err:
+        await replace_step_error(
+            message.bot,
+            state,
+            chat_id=int(message.chat.id),
+            text=err,
+        )
         return
 
-    await state.update_data(description=description)
+    val = normalize_sentence(val)
+    async with get_sessionmaker()() as session:
+        await AdRepo(session).patch_payload(int(ad_id), description=val)
 
     data = await state.get_data()
-    if data.get("is_inline_edit") or data.get("force_preview"):
-        await state.update_data(is_inline_edit=False, force_preview=False, on_moderation=False)
+    if _is_edit_mode(data):
+        await clear_step_error(message.bot, state, chat_id=int(message.chat.id))
+        await clear_step_prompt(message.bot, state, chat_id=int(message.chat.id))
+        await state.update_data(**{K_EDIT_MODE: False})
         await state.set_state(EmployerForm.preview)
-        await send_preview(message, state, message.bot)
+        await _upsert_preview(message.bot, message.chat.id, state, int(ad_id))
         return
 
+    sent = await message.answer(_prompt_contact_mode(), reply_markup=_contact_mode_keyboard_2(int(ad_id)))
+    await track_cleanup_message(state, sent)
     await state.set_state(EmployerForm.media_choice)
-    kb = InlineKeyboardMarkup(
-        inline_keyboard=[
-            [InlineKeyboardButton(text="📎 Прикрепить фото/видео", callback_data="add_media")],
-            [InlineKeyboardButton(text="⛔ Пропустить", callback_data="skip_media")],
-        ]
+
+
+@router.callback_query(
+    StateFilter(EmployerForm.media_choice),
+    F.data.startswith(f"{CB_CONTACT_MODE_INFO}:")
+)
+async def emp_contact_mode_info(cb: CallbackQuery, state: FSMContext):
+    await safe_answer(cb)
+    data = await state.get_data()
+    ad_id = int(data.get("ad_id") or 0)
+    if not ad_id:
+        return
+    try:
+        if cb.message:
+            info_msg = await cb.message.answer(contact_mode_info_text(), parse_mode=ParseMode.HTML)
+            prompt_msg = await cb.message.answer(_prompt_contact_mode(), reply_markup=_contact_mode_keyboard_2(ad_id))
+            await track_cleanup_messages(state, info_msg, prompt_msg)
+    except Exception:
+        pass
+
+
+@router.callback_query(
+    StateFilter(EmployerForm.media_choice),
+    F.data.startswith(f"{CB_CONTACT_MODE_SET}:")
+)
+async def emp_contact_mode_set(cb: CallbackQuery, state: FSMContext):
+    await safe_answer(cb)
+    parts = (cb.data or "").split(":")
+    if len(parts) != 3:
+        return await safe_answer(cb, "⚠️ Некорректные данные", alert=True)
+
+    try:
+        ad_id = int(parts[1])
+    except Exception:
+        return await safe_answer(cb, "⚠️ Некорректные данные", alert=True)
+
+    mode = (parts[2] or "").strip().lower()
+    if mode not in (CONTACT_MODE_CONTACTS, CONTACT_MODE_BOT, CONTACT_MODE_BOTH):
+        return await safe_answer(cb, "⚠️ Некорректный режим", alert=True)
+
+    async with get_sessionmaker()() as session:
+        await AdRepo(session).patch_payload(ad_id, contact_mode=mode)
+
+    await state.update_data(**{"clean_thread_hint_key": "media_choice"})
+    await state.set_state(EmployerForm.media_choice)
+    try:
+        if cb.message:
+            media_msg = await cb.message.answer(
+                "Ок. Теперь медиа.\n\n"
+                "Добавить 🎞 медиа?\n\n"
+                "Сейчас доступно:\n"
+                "• 1 фото\n"
+                f"• или 1 короткое видео до {EMPLOYER_MAX_VIDEO_SECONDS} сек и до 5 МБ\n\n",
+                reply_markup=employer_media_choice_kb(),
+            )
+            await track_cleanup_message(state, media_msg)
+    except Exception:
+        pass
+
+
+@router.callback_query(F.data == "emp_media_add")
+async def emp_media_add(cb: CallbackQuery, state: FSMContext):
+    await safe_answer(cb)
+    await state.set_state(EmployerForm.media_wait)
+    prompt = (
+        "Пришли:\n"
+        "• ОДНО фото\n"
+        f"• или ОДНО короткое видео до {EMPLOYER_MAX_VIDEO_SECONDS} сек и до 5 МБ\n\n"
+        "Альбомы и несколько фото сейчас не поддерживаются."
     )
-    await message.answer("Прикрепи фото/видео или пропусти.", reply_markup=kb)
-
-
-# ---------- MEDIA ----------
-
-@router.callback_query(F.data == "add_media")
-async def employer_add_media(callback: CallbackQuery, state: FSMContext):
-    await state.set_state(EmployerForm.waiting_media)
-    await callback.message.answer("Отправь фото или видео.")
-    await callback.answer()
-
-
-@router.callback_query(F.data == "skip_media")
-async def employer_skip_media(callback: CallbackQuery, state: FSMContext):
-    await state.update_data(media_type=None, media_id=None)
-    await state.set_state(EmployerForm.preview)
-    await send_preview(callback.message, state, callback.bot)
-    await callback.answer()
-
-
-@router.message(EmployerForm.waiting_media, F.photo | F.video)
-async def employer_get_media(message: Message, state: FSMContext):
-    if message.photo:
-        await state.update_data(media_type="photo", media_id=message.photo[-1].file_id)
-    elif message.video:
-        await state.update_data(media_type="video", media_id=message.video.file_id)
+    if cb.message:
+        sent = await cb.message.answer(prompt)
     else:
-        await message.answer("Пришли фото или видео.")
+        sent = await cb.bot.send_message(cb.from_user.id, prompt)
+    await track_cleanup_message(state, sent)
+
+
+@router.callback_query(F.data == "emp_media_skip")
+async def emp_media_skip(cb: CallbackQuery, state: FSMContext):
+    await safe_answer(cb)
+    data = await state.get_data()
+    ad_id = data.get("ad_id")
+    if not ad_id:
+        await _need_restart(cb)
         return
 
+    async with get_sessionmaker()() as session:
+        await AdRepo(session).patch_payload(
+            int(ad_id),
+            photo_file_id=None,
+            photo_file_ids=[],
+            video_file_id=None,
+        )
+
     await state.set_state(EmployerForm.preview)
-    await send_preview(message, state, message.bot)
+    await _upsert_preview(cb.bot, cb.from_user.id, state, int(ad_id))
+
+
+@router.message(EmployerForm.media_wait, F.photo)
+async def emp_media_wait_photo(message: Message, state: FSMContext):
+    await track_cleanup_message(state, message)
+
+    if getattr(message, "media_group_id", None):
+        sent = await message.answer(
+            "Сейчас можно отправить только ОДНО фото одним сообщением.\n"
+            "Альбом из нескольких фото не поддерживается."
+        )
+        await track_cleanup_message(state, sent)
+        return
+
+    file_id = message.photo[-1].file_id
+    await state.update_data(**{K_PENDING_MEDIA: {"type": "photo", "file_id": file_id}})
+    await state.set_state(EmployerForm.media_confirm)
+    sent = await message.answer("Принял фото. Подтверждаешь?", reply_markup=media_confirm_kb("emp_media_confirm"))
+    await track_cleanup_message(state, sent)
+
+
+@router.message(EmployerForm.media_wait, F.video)
+async def emp_media_wait_video(message: Message, state: FSMContext):
+    await track_cleanup_message(state, message)
+
+    video = message.video
+    duration = int(getattr(video, "duration", 0) or 0)
+    file_size = int(getattr(video, "file_size", 0) or 0)
+
+    if duration > EMPLOYER_MAX_VIDEO_SECONDS:
+        sent = await message.answer(
+            f"Видео слишком длинное.\n"
+            f"Максимум: {EMPLOYER_MAX_VIDEO_SECONDS} секунд."
+        )
+        await track_cleanup_message(state, sent)
+        return
+
+    if file_size > EMPLOYER_MAX_VIDEO_SIZE_BYTES:
+        sent = await message.answer(
+            "Видео слишком тяжёлое.\n"
+            "Максимум: 5 МБ."
+        )
+        await track_cleanup_message(state, sent)
+        return
+
+    file_id = video.file_id
+    await state.update_data(**{K_PENDING_MEDIA: {"type": "video", "file_id": file_id}})
+    await state.set_state(EmployerForm.media_confirm)
+    sent = await message.answer("Принял видео. Подтверждаешь?", reply_markup=media_confirm_kb("emp_media_confirm"))
+    await track_cleanup_message(state, sent)
+
+
+@router.message(EmployerForm.media_wait)
+async def emp_media_wait_bad(message: Message, state: FSMContext):
+    await track_cleanup_message(state, message)
+    sent = await message.answer(
+        "Нужно отправить:\n"
+        "• ОДНО фото\n"
+        f"• или ОДНО короткое видео до {EMPLOYER_MAX_VIDEO_SECONDS} сек и до 5 МБ\n\n"
+        "Текст и другие форматы сейчас не подходят."
+    )
+    await track_cleanup_message(state, sent)
+
+
+@router.callback_query(F.data.startswith("emp_media_confirm:"))
+async def emp_media_confirm(cb: CallbackQuery, state: FSMContext):
+    await safe_answer(cb)
+    action = (cb.data or "").split(":")[1]
+
+    data = await state.get_data()
+    ad_id = data.get("ad_id")
+    pending = data.get(K_PENDING_MEDIA)
+    if not ad_id:
+        await _need_restart(cb)
+        return
+
+    if action == "retry":
+        await state.update_data(**{K_PENDING_MEDIA: None})
+        await state.set_state(EmployerForm.media_wait)
+        if cb.message:
+            sent = await cb.message.answer("Ок. Пришли заново: одно фото или одно короткое видео.")
+        else:
+            sent = await cb.bot.send_message(cb.from_user.id, "Ок. Пришли заново: одно фото или одно короткое видео.")
+        await track_cleanup_message(state, sent)
+        return
+
+    if action == "delete":
+        async with get_sessionmaker()() as session:
+            await AdRepo(session).patch_payload(
+                int(ad_id),
+                photo_file_id=None,
+                photo_file_ids=[],
+                video_file_id=None,
+            )
+        await state.update_data(**{K_PENDING_MEDIA: None})
+        await state.set_state(EmployerForm.preview)
+        await _upsert_preview(cb.bot, cb.from_user.id, state, int(ad_id))
+        return
+
+    if not pending or not isinstance(pending, dict):
+        await safe_answer(cb, "⚠️ Не вижу файл. Пришли медиа ещё раз.", alert=True)
+        await state.set_state(EmployerForm.media_wait)
+        return
+
+    patch: dict[str, Any] = {
+        "photo_file_id": None,
+        "photo_file_ids": [],
+        "video_file_id": None,
+    }
+
+    ptype = pending.get("type")
+
+    if ptype == "photo":
+        fid = str(pending.get("file_id") or "").strip()
+        if not fid:
+            await safe_answer(cb, "⚠️ Не вижу фото. Пришли медиа ещё раз.", alert=True)
+            await state.set_state(EmployerForm.media_wait)
+            return
+        patch["photo_file_id"] = fid
+        patch["photo_file_ids"] = [fid]
+
+    elif ptype == "video":
+        fid = str(pending.get("file_id") or "").strip()
+        if not fid:
+            await safe_answer(cb, "⚠️ Не вижу видео. Пришли медиа ещё раз.", alert=True)
+            await state.set_state(EmployerForm.media_wait)
+            return
+        patch["video_file_id"] = fid
+
+    else:
+        await safe_answer(cb, "⚠️ Не вижу файл. Пришли медиа ещё раз.", alert=True)
+        await state.set_state(EmployerForm.media_wait)
+        return
+
+    async with get_sessionmaker()() as session:
+        await AdRepo(session).patch_payload(int(ad_id), **patch)
+
+    try:
+        if cb.message:
+            await cb.message.edit_reply_markup(reply_markup=media_confirmed_stub_kb())
+    except Exception:
+        pass
+
+    await state.update_data(**{K_PENDING_MEDIA: None})
+    await state.set_state(EmployerForm.preview)
+    await _upsert_preview(cb.bot, cb.from_user.id, state, int(ad_id))
+
+
+
+
+
+async def _edit_metro_card(cb: CallbackQuery, text: str, reply_markup=None) -> None:
+    await shared_edit_metro_card(cb, text, reply_markup=reply_markup)
+
+
+@router.callback_query(StateFilter(EmployerForm.location), F.data == METRO_CLOSE_CALLBACK)
+async def _metro_close(cb: CallbackQuery):
+    await shared_metro_close(
+        cb=cb,
+        safe_answer_fn=safe_answer,
+        prompt_location_text=_prompt_location(),
+        metro_location_keyboard_fn=metro_location_keyboard,
+    )
+
+
+@router.callback_query(StateFilter(EmployerForm.location), F.data.startswith(METRO_PICK_CALLBACK))
+async def _metro_pick(cb: CallbackQuery, state: FSMContext):
+    await shared_metro_pick(
+        cb=cb,
+        safe_answer_fn=safe_answer,
+        metro_lines_keyboard_fn=metro_lines_keyboard,
+    )
+
+
+@router.callback_query(StateFilter(EmployerForm.location), F.data.startswith(METRO_LINE_CALLBACK + ':'))
+async def _metro_line_pick(cb: CallbackQuery, state: FSMContext):
+    await shared_metro_line_pick(
+        cb=cb,
+        safe_answer_fn=safe_answer,
+        metro_stations_keyboard_fn=metro_stations_keyboard,
+    )
+
+
+@router.callback_query(StateFilter(EmployerForm.location), F.data.startswith(METRO_STATION_CALLBACK + ':'))
+async def _metro_station_pick(cb: CallbackQuery, state: FSMContext):
+    from findex_bot.handlers.shared_metro_station_finalize import finalize_location_payload
+
+    await safe_answer(cb)
+    parts = (cb.data or '').split(':')
+    if len(parts) < 3:
+        return
+    line_uid = parts[1]
+    station = resolve_station(line_uid, int(parts[2]))
+    if not station:
+        return await safe_answer(cb, '⚠️ Не удалось определить станцию', alert=True)
+
+    location_value, ad_id = await finalize_location_payload(
+        state=state,
+        station=station,
+    )
+    if not ad_id:
+        return await safe_answer(cb, '⚠️ Сессия сбилась. Нажми /start.', alert=True)
+
+    data = await state.get_data()
+
+    if _is_edit_mode(data):
+        await state.update_data(**{K_EDIT_MODE: False})
+        await state.set_state(EmployerForm.preview)
+        try:
+            await _edit_metro_card(cb, '✅ Изменения сохранены')
+        except Exception:
+            pass
+        await _upsert_preview(cb.bot, cb.from_user.id, state, int(ad_id))
+        return
+
+    await state.set_state(EmployerForm.contacts)
+    try:
+        await _edit_metro_card(cb, f"✅ Локация сохранена: {location_value}\n\n" + _prompt_contacts())
+    except Exception:
+        pass
+
+
+
+
+async def _send_employer_contact_mode_hint(message: Message) -> None:
+    import asyncio
+    import contextlib
+
+    hint = None
+    try:
+        hint = await message.bot.send_message(
+            chat_id=message.chat.id,
+            text=get_hint_text(VACANCY_CONTACT_MODE_TRASH),
+        )
+        await asyncio.sleep(4)
+    except Exception:
+        return
+    finally:
+        with contextlib.suppress(Exception):
+            if hint:
+                await hint.delete()
+
+
+
+async def _send_employer_media_choice_hint(message: Message) -> None:
+    from findex_bot.handlers.shared_media_hints import send_media_choice_hint
+
+    await send_media_choice_hint(
+        message,
+        text=get_hint_text(VACANCY_MEDIA_CHOICE_TRASH),
+    )
+
+
+@router.message(EmployerForm.media_choice, F.text)
+async def _employer_contact_mode_clean_thread(message: Message, state: FSMContext):
+    import contextlib
+
+    raw = (message.text or "").strip()
+    if not raw or raw.startswith("/"):
+        return
+
+    with contextlib.suppress(Exception):
+        await message.delete()
+
+    data = await state.get_data()
+    hk = str((data or {}).get("clean_thread_hint_key") or "").strip().lower()
+
+    if hk == "media_choice":
+        await _send_employer_media_choice_hint(message)
+        return
+
+    await _send_employer_contact_mode_hint(message)
+
+
+
+async def _send_employer_preview_hint(message: Message, text: str) -> None:
+    import asyncio
+    import contextlib
+
+    hint = None
+    try:
+        hint = await message.answer(text)
+        await asyncio.sleep(4)
+    except Exception:
+        return
+    finally:
+        with contextlib.suppress(Exception):
+            if hint:
+                await hint.delete()
+
+
+@router.message(StateFilter(EmployerForm.preview, EmployerForm.media_choice, EmployerForm.media_confirm))
+async def employer_buttons_only_trash(message: Message, state: FSMContext):
+    await track_cleanup_message(state, message)
+
+    try:
+        await delete_user_input_message(message.bot, message)
+    except Exception:
+        pass
+
+    try:
+        cur = await state.get_state()
+    except Exception:
+        cur = None
+
+    data = await state.get_data()
+
+    if cur == EmployerForm.preview.state:
+        if (data or {}).get("on_moderation"):
+            hint_text = get_hint_text(VACANCY_ON_MODERATION_TRASH)
+        else:
+            hint_text = get_hint_text(VACANCY_PREVIEW_TRASH)
+    elif cur == EmployerForm.media_choice.state:
+        hint_text = get_hint_text(VACANCY_MEDIA_CHOICE_TRASH)
+    else:
+        hint_text = get_hint_text(VACANCY_MEDIA_CONFIRM_TRASH)
+
+    await _send_employer_preview_hint(message, hint_text)
+
+
+@router.callback_query(F.data.startswith("send_employer:"))
+async def emp_send(cb: CallbackQuery, state: FSMContext):
+    await safe_answer(cb)
+    ad_id = _parse_id(cb.data)
+
+    await state.update_data(on_moderation=True, clean_thread_hint_key="post_moderation")
+    data = await state.get_data()
+
+    if not is_unlimited(int(cb.from_user.id), getattr(cb.from_user, "username", None)):
+        published = await _published_today(int(cb.from_user.id))
+        if published >= DAILY_FREE_LIMIT:
+            warn = _limit_block_text(published)
+            try:
+                await safe_answer(cb, warn, alert=True)
+            except Exception:
+                pass
+            try:
+                await cb.bot.send_message(cb.from_user.id, warn)
+            except Exception:
+                pass
+            return
+
+    async with get_sessionmaker()() as session:
+        repo = AdRepo(session)
+        ad = await repo.get(ad_id)
+        if not ad:
+            return await safe_answer(cb, "❌ Не найдено", alert=True)
+
+        if ad.status == "pending":
+            return await safe_answer(cb, "⏳ Уже на модерации", alert=True)
+        if ad.status == "published":
+            return await safe_answer(cb, "⚠️ Уже опубликовано", alert=True)
+
+        payload = ad.payload or {}
+
+        try:
+            prev_preview_chat_id = int(payload.get("preview_chat_id") or cb.from_user.id or 0)
+        except Exception:
+            prev_preview_chat_id = int(cb.from_user.id)
+
+        try:
+            prev_preview_message_id = int(payload.get("preview_message_id") or 0)
+        except Exception:
+            prev_preview_message_id = 0
+
+        if not (payload.get("contact_mode") in (CONTACT_MODE_CONTACTS, CONTACT_MODE_BOT, CONTACT_MODE_BOTH)):
+            await safe_answer(cb, "⚠️ Сначала выбери, как принимать отклики.", alert=True)
+            try:
+                await cb.bot.send_message(cb.from_user.id, _prompt_contact_mode(), reply_markup=_contact_mode_keyboard_2(ad_id))
+            except Exception:
+                pass
+            return
+
+        mod_chat_id = _get_moderation_chat_id()
+        thread_id = _get_thread_vacancies()
+
+        base_text = get_ad_text(ad)
+        text = _sanitize_moderation_text(base_text + _moderation_user_footer(cb))
+
+        photo_id = _get_primary_photo_id(payload)
+        video_id = payload.get("video_file_id")
+
+        send_kwargs = {}
+        if thread_id:
+            send_kwargs["message_thread_id"] = thread_id
+
+        if video_id:
+            msg = await cb.bot.send_video(
+                mod_chat_id,
+                video=video_id,
+                caption=text,
+                reply_markup=moderation_keyboard(ad_id),
+                **send_kwargs,
+            )
+        elif photo_id:
+            msg = await cb.bot.send_photo(
+                mod_chat_id,
+                photo=photo_id,
+                caption=text,
+                reply_markup=moderation_keyboard(ad_id),
+                **send_kwargs,
+            )
+        else:
+            msg = await cb.bot.send_message(mod_chat_id, text, reply_markup=moderation_keyboard(ad_id), **send_kwargs)
+
+        await repo.set_status(ad_id, "pending")
+
+        preview_chat_id = int(cb.message.chat.id) if cb.message else int(cb.from_user.id)
+        preview_message_id = int(cb.message.message_id) if cb.message else 0
+        preview_is_media = bool(getattr(cb.message, "caption", None) is not None) if cb.message else False
+
+        await repo.patch_payload(
+            ad_id,
+            moderation_chat_id=msg.chat.id,
+            moderation_message_id=msg.message_id,
+            moderation_album_message_ids=[],
+            author_id=cb.from_user.id,
+            role="employer",
+            preview_chat_id=preview_chat_id,
+            preview_message_id=preview_message_id,
+            preview_is_media=preview_is_media,
+            preview_status="moderation",
+            rejected_reason=None,
+            rejected_field=None,
+            reject_notice_chat_id=None,
+            reject_notice_message_id=None,
+        )
+
+    try:
+        if cb.message:
+            try:
+                await cb.message.edit_reply_markup(reply_markup=sent_to_moderation_stub_kb())
+            except Exception:
+                pass
+
+            try:
+                current_mid = int(cb.message.message_id)
+            except Exception:
+                current_mid = 0
+
+            try:
+                current_chat_id = int(cb.message.chat.id)
+            except Exception:
+                current_chat_id = int(cb.from_user.id)
+
+            try:
+                stale_ids = []
+                for raw_id in (
+                    prev_preview_message_id,
+                    data.get(K_PREVIEW_MSG_ID),
+                ):
+                    try:
+                        v = int(raw_id or 0)
+                        if v > 0 and v != current_mid and v not in stale_ids:
+                            stale_ids.append(v)
+                    except Exception:
+                        pass
+
+                for stale_id in stale_ids:
+                    await cb.bot.delete_message(
+                        chat_id=int(prev_preview_chat_id or current_chat_id),
+                        message_id=int(stale_id),
+                    )
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+    return await safe_answer(cb, "✅ Отправлено на модерацию", alert=True)

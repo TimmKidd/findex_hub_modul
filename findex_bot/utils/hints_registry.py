@@ -1,0 +1,174 @@
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import Final
+
+
+@dataclass(frozen=True, slots=True)
+class HintSpec:
+    point: str
+    canonical_text: str
+    ux_condition: str
+    ux_points: int
+    status: str  # live | target
+
+
+WELCOME_ROLES_TRASH = "welcome_roles_trash"
+MENU_ROOT_TRASH = "menu_root_trash"
+MENU_DIAG_PUBLICATION_TRASH = "menu_diag_publication_trash"
+MENU_DIAG_PENDING_CARD_TRASH = "menu_diag_pending_card_trash"
+MENU_ALERTS_ROOT_TRASH = "menu_alerts_root_trash"
+MENU_RESPONDS_ROOT_TRASH = "menu_responds_root_trash"
+VACANCY_CONTACT_MODE_TRASH = "vacancy_contact_mode_trash"
+VACANCY_MEDIA_CHOICE_TRASH = "vacancy_media_choice_trash"
+VACANCY_MEDIA_CONFIRM_TRASH = "vacancy_media_confirm_trash"
+VACANCY_PREVIEW_TRASH = "vacancy_preview_trash"
+VACANCY_ON_MODERATION_TRASH = "vacancy_on_moderation_trash"
+RESPOND_INTRO_CHOICE_TRASH = "respond_intro_choice_trash"
+RESPOND_SAVED_CHOICE_TRASH = "respond_saved_choice_trash"
+RESPOND_FORM_PREVIEW_TRASH = "respond_form_preview_trash"
+RESPOND_EXISTING_NOTICE_TRASH = "respond_existing_notice_trash"
+RESPOND_CITIZENSHIP_PICK_TRASH = "respond_citizenship_pick_trash"
+RESPOND_ACTIVE_CARD_TRASH = "respond_active_card_trash"
+
+
+HINTS: Final[dict[str, HintSpec]] = {
+    WELCOME_ROLES_TRASH: HintSpec(
+        point=WELCOME_ROLES_TRASH,
+        canonical_text="Нажми одну из кнопок выше: 🏢 Работодатель или 👤 Соискатель.",
+        ux_condition="мусор под экраном выбора роли",
+        ux_points=1,
+        status="live",
+    ),
+    MENU_ROOT_TRASH: HintSpec(
+        point=MENU_ROOT_TRASH,
+        canonical_text="Используй кнопки меню выше: здесь ты можешь управлять откликами, уведомлениями и объявлениями.",
+        ux_condition="мусор под корневым блоком меню",
+        ux_points=1,
+        status="live",
+    ),
+    MENU_DIAG_PUBLICATION_TRASH: HintSpec(
+        point=MENU_DIAG_PUBLICATION_TRASH,
+        canonical_text="Используй кнопки выше: здесь ты можешь проверить статус публикации и открыть объявления на модерации.",
+        ux_condition="мусор под блоком «Диагностика публикации»",
+        ux_points=1,
+        status="live",
+    ),
+    MENU_DIAG_PENDING_CARD_TRASH: HintSpec(
+        point=MENU_DIAG_PENDING_CARD_TRASH,
+        canonical_text="Используй кнопки выше: вернись в диагностику или в меню.",
+        ux_condition="мусор под открытой карточкой объявления из диагностики",
+        ux_points=1,
+        status="live",
+    ),
+    MENU_ALERTS_ROOT_TRASH: HintSpec(
+        point=MENU_ALERTS_ROOT_TRASH,
+        canonical_text="Используй кнопки выше: здесь ты можешь создавать уведомления и управлять своими алертами.",
+        ux_condition="мусор под блоком «Уведомления / Алерты»",
+        ux_points=1,
+        status="live",
+    ),
+    MENU_RESPONDS_ROOT_TRASH: HintSpec(
+        point=MENU_RESPONDS_ROOT_TRASH,
+        canonical_text="Используй кнопки выше: здесь ты можешь смотреть свои отклики и ответы по ним.",
+        ux_condition="мусор под блоком «Мои отклики»",
+        ux_points=1,
+        status="live",
+    ),
+    VACANCY_CONTACT_MODE_TRASH: HintSpec(
+        point=VACANCY_CONTACT_MODE_TRASH,
+        canonical_text="Нажми одну из кнопок выше: 🔒 Отклики через бота или 📞 Контакты в объявлении.",
+        ux_condition="мусор под экраном выбора способа получения откликов",
+        ux_points=2,
+        status="live",
+    ),
+    VACANCY_MEDIA_CHOICE_TRASH: HintSpec(
+        point=VACANCY_MEDIA_CHOICE_TRASH,
+        canonical_text="Нажми одну из кнопок выше: ➕ Добавить медиа или ⏭ Без медиа.",
+        ux_condition="мусор под экраном выбора медиа",
+        ux_points=2,
+        status="live",
+    ),
+    VACANCY_MEDIA_CONFIRM_TRASH: HintSpec(
+        point=VACANCY_MEDIA_CONFIRM_TRASH,
+        canonical_text="Нажми одну из кнопок выше: ✅ Подтвердить, 🔁 Заменить или 🗑 Удалить.",
+        ux_condition="мусор под экраном подтверждения медиа",
+        ux_points=2,
+        status="live",
+    ),
+    VACANCY_PREVIEW_TRASH: HintSpec(
+        point=VACANCY_PREVIEW_TRASH,
+        canonical_text="Используй кнопки выше: исправить поле, изменить медиа или отправить объявление на модерацию.",
+        ux_condition="мусор под preview объявления до отправки на модерацию",
+        ux_points=2,
+        status="live",
+    ),
+    VACANCY_ON_MODERATION_TRASH: HintSpec(
+        point=VACANCY_ON_MODERATION_TRASH,
+        canonical_text="⏳ Объявление уже отправлено на модерацию. Дождись ответа модератора.",
+        ux_condition="мусор под preview объявления, которое уже отправлено на модерацию",
+        ux_points=2,
+        status="live",
+    ),
+    RESPOND_INTRO_CHOICE_TRASH: HintSpec(
+        point=RESPOND_INTRO_CHOICE_TRASH,
+        canonical_text='👆 Нажми кнопку «⚡ Откликнуться за 1 минуту» выше.',
+        ux_condition="мусор под intro-карточкой отклика до старта быстрого отклика",
+        ux_points=1,
+        status="live",
+    ),
+    RESPOND_SAVED_CHOICE_TRASH: HintSpec(
+        point=RESPOND_SAVED_CHOICE_TRASH,
+        canonical_text="Нажми одну из кнопок выше: ⚡ Быстрый отклик или ✏️ Заполнить заново.",
+        ux_condition="мусор под экраном выбора между быстрым откликом и перезапуском заполнения",
+        ux_points=1,
+        status="live",
+    ),
+    RESPOND_FORM_PREVIEW_TRASH: HintSpec(
+        point=RESPOND_FORM_PREVIEW_TRASH,
+        canonical_text="Используй кнопки выше: измени поле или отправь отклик.",
+        ux_condition="мусор под preview анкеты отклика перед отправкой",
+        ux_points=1,
+        status="live",
+    ),
+    RESPOND_EXISTING_NOTICE_TRASH: HintSpec(
+        point=RESPOND_EXISTING_NOTICE_TRASH,
+        canonical_text='Используй кнопку «Открыть мой отклик» в карточке выше.',
+        ux_condition="мусор под notice-экраном, где уже существует отклик на это объявление",
+        ux_points=1,
+        status="live",
+    ),
+    RESPOND_CITIZENSHIP_PICK_TRASH: HintSpec(
+        point=RESPOND_CITIZENSHIP_PICK_TRASH,
+        canonical_text='Здесь нужно выбрать гражданство кнопкой выше. Если страны нет в списке — нажми «🌍 Другая страна».',
+        ux_condition="мусор под экраном выбора гражданства в анкете отклика",
+        ux_points=1,
+        status="live",
+    ),
+    RESPOND_ACTIVE_CARD_TRASH: HintSpec(
+        point=RESPOND_ACTIVE_CARD_TRASH,
+        canonical_text="Управляй откликом кнопками в карточке выше или воспользуйся /menu",
+        ux_condition="мусор под активной карточкой отклика",
+        ux_points=2,
+        status="target",
+    ),
+}
+
+
+def get_hint_spec(point: str) -> HintSpec:
+    spec = HINTS.get(point)
+    if spec is None:
+        raise KeyError(f"Unknown hint point: {point}")
+    return spec
+
+
+def get_hint_text(point: str) -> str:
+    return get_hint_spec(point).canonical_text
+
+
+def is_live_hint(point: str) -> bool:
+    return get_hint_spec(point).status == "live"
+
+
+def all_hint_points() -> tuple[str, ...]:
+    return tuple(HINTS.keys())

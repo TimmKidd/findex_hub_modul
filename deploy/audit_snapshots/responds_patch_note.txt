@@ -1,0 +1,4 @@
+Старый TEST contour (findex-local-test-*) имел schema drift по таблице responds относительно фактической MAIN schema.
+Ручной patch был применён только к TEST базе findex_test_local в контейнере findex-local-test-postgres-1.
+MAIN не изменялся.
+Причина: runtime-код и MAIN ожидают owner_viewed_at, owner_notified_at, ping12_sent_at, ping36_sent_at, ping_owner24_sent_at, а TEST их не содержал.

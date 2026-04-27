@@ -1,0 +1,50 @@
+# runtime
+dump.rdb
+*.db
+*.sqlite
+*.sqlite3
+
+# python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+.mypy_cache/
+
+# env
+.env
+.venv/
+venv/
+
+# macOS
+.DS_Store
+
+# backups
+*.bak
+*.tmp
+*.swp
+
+# archives / snapshots
+_archive/
+deploy/recovery_snapshots/
+deploy/recovery_from_images/
+
+# logs
+*.log
+
+# local env files
+env.dev
+deploy/local.test.env
+deploy/main.env
+
+# sql dumps / manual audit snapshots
+*.sql
+deploy/audit_snapshots/*.sql
+
+# Support bot local secrets
+support_bot/.env
+
+# Runtime logs and pid files
+*.log
+*.pid

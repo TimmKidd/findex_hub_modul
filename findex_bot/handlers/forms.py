@@ -1,665 +1,1564 @@
-# === forms.py ===
+# findex_bot/handlers/forms.py
 from __future__ import annotations
 
-import uuid
+import asyncio
 import logging
-from typing import Optional, Tuple
+from typing import Optional, Any, Tuple
 
 from aiogram import Router, F
-from aiogram.enums import ParseMode
-from aiogram.fsm.context import FSMContext
 from aiogram.types import (
     CallbackQuery,
+    TelegramObject,
     InlineKeyboardMarkup,
     InlineKeyboardButton,
     LinkPreviewOptions,
 )
+from aiogram.dispatcher.middlewares.base import BaseMiddleware
+from aiogram.fsm.context import FSMContext
 
-from findex_bot.states.vacancies import EmployerForm, SeekerForm
-from findex_bot.utils.ui_utils import (
-    moderation_keyboard,
-    rejection_keyboard,
-    send_ad_preview,
-    get_full_edit_keyboard,
-    NOOP_CALLBACK,
+import findex_bot.runtime as runtime
+from findex_bot.db.db import get_sessionmaker
+from findex_bot.db.repo import AdRepo
+from findex_bot.db.daily_limits import (
+    get_count as db_get_pub_count,
+    inc_and_get as db_inc_pub_count,
 )
+from findex_bot.utils.ui_utils import (
+    safe_answer,
+    DAILY_FREE_LIMIT,
+    is_unlimited,
+    utc_seconds_to_reset,
+    format_hhmmss,
+    CONTACT_MODE_BOT,
+    CONTACT_MODE_CONTACTS,
+    CONTACT_MODE_BOTH,
+    published_preview_kb,
+    rejection_keyboard,
+    rejected_user_text,
+    employer_media_choice_kb,
+    seeker_media_choice_kb,
+    reset_cleanup_bucket,
+    track_cleanup_message,
+)
+from findex_bot.utils.vacancy_utils import get_ad_text, resolve_ad_role
+from findex_bot.handlers.alerts import fire_alerts_on_publish
+from findex_bot.handlers.forms_parts.preview_edit_router import _parse_preview_edit, _start_edit_from_preview
+from findex_bot.handlers.forms_parts.published_preview_render_service import _send_published_preview_message, _replace_published_preview_message
+from findex_bot.utils.moscow_metro import metro_location_prompt, metro_location_keyboard
 
 logger = logging.getLogger(__name__)
-
 router = Router()
 
-# ------------------------------------------------------
-# SAFE ANSWER / SAFE EDIT
-# ------------------------------------------------------
+K_EDIT_MODE = "edit_mode"
+K_PREVIEW_MSG_ID = "preview_msg_id"
+K_PREVIEW_IS_MEDIA = "preview_is_media"
+LIMIT_NOTICE_TTL_SEC = 5
 
 
-async def _safe_answer(callback: CallbackQuery, text: str | None = None, show_alert: bool = False):
+def _limit_notice_cache() -> dict[int, tuple[int, int]]:
+    cache = getattr(runtime, "LIMIT_NOTICE_MESSAGES", None)
+    if not isinstance(cache, dict):
+        cache = {}
+        setattr(runtime, "LIMIT_NOTICE_MESSAGES", cache)
+    return cache
+
+
+async def _send_limit_notice(bot, user_id: int, text: str) -> None:
+    """
+    Один служебный лимитный message на пользователя.
+    При повторном нажатии старый удаляем, новый отправляем и тоже автоудаляем.
+    Никаких новых зависимостей/Redis тут не добавляем.
+    """
+    uid = int(user_id)
+    cache = _limit_notice_cache()
+    old = cache.get(uid)
+    if old:
+        old_chat_id, old_message_id = old
+        try:
+            await bot.delete_message(chat_id=int(old_chat_id), message_id=int(old_message_id))
+        except Exception:
+            pass
+
+    msg = await bot.send_message(
+        uid,
+        text,
+        link_preview_options=LinkPreviewOptions(is_disabled=True),
+    )
+    cache[uid] = (int(msg.chat.id), int(msg.message_id))
+
+    async def _delete_later(chat_id: int, message_id: int, target_uid: int) -> None:
+        try:
+            await asyncio.sleep(LIMIT_NOTICE_TTL_SEC)
+            try:
+                await bot.delete_message(chat_id=chat_id, message_id=message_id)
+            except Exception:
+                pass
+        finally:
+            current = cache.get(target_uid)
+            if current == (chat_id, message_id):
+                cache.pop(target_uid, None)
+
+    asyncio.create_task(_delete_later(int(msg.chat.id), int(msg.message_id), uid))
+
+
+def _get_primary_photo_id(payload: dict[str, Any] | None) -> str | None:
+    p = payload or {}
+
+    one = p.get("photo_file_id")
+    if one:
+        s = str(one).strip()
+        if s:
+            return s
+
+    raw = p.get("photo_file_ids")
+    if isinstance(raw, list):
+        for x in raw:
+            s = str(x).strip()
+            if s:
+                return s
+
+    return None
+
+
+async def _delete_message_ids(bot, chat_id: int, message_ids: list[int]) -> None:
+    for mid in message_ids:
+        try:
+            await bot.delete_message(chat_id=chat_id, message_id=int(mid))
+        except Exception:
+            pass
+
+
+def channel_ad_kb(ad_id: int) -> InlineKeyboardMarkup:
+    bot_username = str(getattr(runtime, "BOT_USERNAME", "") or "").lstrip("@").strip()
+
+    if bot_username:
+        url = f"https://t.me/{bot_username}?start=resp_{int(ad_id)}"
+        return InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="📩 Откликнуться", url=url)]])
+
+    return InlineKeyboardMarkup(
+        inline_keyboard=[[InlineKeyboardButton(text="📩 Откликнуться", callback_data=f"respond:{ad_id}")]]
+    )
+
+
+class SavedHintMiddleware(BaseMiddleware):
+    async def __call__(self, handler, event: TelegramObject, data: dict):
+        return await handler(event, data)
+
+
+def _moderator_label(cb: CallbackQuery) -> str:
+    u = cb.from_user
+    if u and u.username:
+        return f"@{u.username}"
+    if u:
+        return f"<code>{u.id}</code>"
+    return "—"
+
+
+def _publish_info_block(cb: CallbackQuery, public_url: str | None) -> str:
+    url = public_url or "—"
+    return f"\n\n✅ Опубликовано!\nМодератор: {_moderator_label(cb)}\nСсылка: {url}"
+
+
+def _strip_publish_info(text: str) -> str:
+    if not text:
+        return text
+    marker = "\n\n✅ Опубликовано!"
+    if marker in text:
+        return text.split(marker)[0]
+    return text
+
+
+def _safe_trunc_4096(s: str) -> str:
+    s = s or ""
+    if len(s) <= 4096:
+        return s
+    return s[:4093] + "…"
+
+
+def _safe_trunc_caption_1024(s: str) -> str:
+    s = (s or "").strip()
+    if len(s) <= 1024:
+        return s
+    return s[:1021] + "…"
+
+
+async def _edit_moderation_message_published(cb: CallbackQuery, public_url: str | None) -> None:
+    if not cb.message:
+        return
+
+    add = _publish_info_block(cb, public_url)
+
     try:
-        if text is None:
-            await callback.answer()
+        if cb.message.caption is not None:
+            base = _strip_publish_info(cb.message.caption)
+            new_caption = base + add
+            if len(new_caption) > 1024:
+                new_caption = new_caption[:1021] + "…"
+            await cb.message.edit_caption(caption=new_caption, reply_markup=None)
         else:
-            await callback.answer(text, show_alert=show_alert)
+            base = _strip_publish_info(cb.message.text or "")
+            await cb.message.edit_text(_safe_trunc_4096(base + add), reply_markup=None)
     except Exception:
         pass
 
 
-async def _safe_edit(
-    callback: CallbackQuery,
-    text: str,
-    reply_markup: InlineKeyboardMarkup | None = None,
-    parse_mode: ParseMode | None = None,
-    disable_preview: bool = False,
-    allow_fallback: bool = True,  # allow_fallback=False → не создаём новое сообщение (важно для мод-чата)
-):
-    msg = callback.message
+async def _edit_moderation_message_rejected(cb: CallbackQuery, reason: str) -> None:
+    if not cb.message:
+        return
+
+    add = f"\n\n❌ Отклонено\nМодератор: {_moderator_label(cb)}\nПричина: {reason}"
+
     try:
-        # Текстовое сообщение
-        if getattr(msg, "text", None):
-            return await msg.edit_text(
-                text,
-                reply_markup=reply_markup,
-                parse_mode=parse_mode,
-                link_preview_options=LinkPreviewOptions(is_disabled=True) if disable_preview else None,
-            )
-
-        # Фото/видео сообщение (caption)
-        if getattr(msg, "caption", None) is not None:
-            return await msg.edit_caption(
-                caption=text,
-                reply_markup=reply_markup,
-                parse_mode=parse_mode,
-            )
+        if cb.message.caption is not None:
+            base = (cb.message.caption or "").split("\n\n❌ Отклонено\n", 1)[0]
+            new_caption = base + add
+            if len(new_caption) > 1024:
+                new_caption = new_caption[:1021] + "…"
+            await cb.message.edit_caption(caption=new_caption, reply_markup=None)
+        else:
+            base = (cb.message.text or "").split("\n\n❌ Отклонено\n", 1)[0]
+            await cb.message.edit_text(_safe_trunc_4096(base + add), reply_markup=None)
     except Exception:
-        if not allow_fallback:
-            return None
+        pass
 
-    if allow_fallback:
+
+async def _sync_original_moderation_message_published(
+    *,
+    bot,
+    ad,
+    cb: CallbackQuery,
+    public_url: str | None,
+) -> None:
+    """
+    Синхронизирует оригинальную карточку модерации, если approve был нажат
+    не на ней, а на её копии из /намодерации.
+    """
+    try:
+        payload = ad.payload or {}
+        mod_chat_id = int(payload.get("moderation_chat_id") or 0)
+        mod_message_id = int(payload.get("moderation_message_id") or 0)
+
+        if not mod_chat_id or not mod_message_id:
+            return
+
+        if cb.message:
+            try:
+                if (
+                    int(cb.message.chat.id) == mod_chat_id
+                    and int(cb.message.message_id) == mod_message_id
+                ):
+                    return
+            except Exception:
+                pass
+
+        add = _publish_info_block(cb, public_url)
+
+        base = get_ad_text(ad)
+
+        author_username = str(payload.get("author_username") or "").strip()
+        author_name = str(payload.get("author_name") or "").strip()
+        author_id = payload.get("author_id") or getattr(ad, "author_user_id", None)
+
+        author_block = ""
+        if author_username:
+            author_block += f"\n\nАвтор: @{author_username}"
+        if author_id:
+            author_block += f"\nTelegram ID: {author_id}"
+        if author_name:
+            author_block += f"\nИмя: {author_name}"
+
         try:
-            return await callback.bot.send_message(
-                chat_id=msg.chat.id,
-                text=text,
-                reply_markup=reply_markup,
-                parse_mode=parse_mode,
-                link_preview_options=LinkPreviewOptions(is_disabled=True) if disable_preview else None,
+            await bot.edit_message_caption(
+                chat_id=mod_chat_id,
+                message_id=mod_message_id,
+                caption=_safe_trunc_caption_1024((base or "").strip() + author_block + add),
+                reply_markup=None,
+            )
+            return
+        except Exception:
+            pass
+
+        try:
+            await bot.edit_message_text(
+                chat_id=mod_chat_id,
+                message_id=mod_message_id,
+                text=_safe_trunc_4096((base or "").strip() + author_block + add),
+                reply_markup=None,
             )
         except Exception:
-            return None
-
-
-def _get_msg_text_or_caption(callback: CallbackQuery) -> str:
-    msg = callback.message
-    return (getattr(msg, "text", None) or getattr(msg, "caption", None) or "").strip()
-
-
-def _append_once(base: str, add: str) -> str:
-    add_clean = (add or "").strip()
-    if not add_clean:
-        return base
-    if add_clean in (base or ""):
-        return base
-    return f"{base.rstrip()}\n\n{add_clean}" if (base or "").strip() else add_clean
-
-
-# ------------------------------------------------------
-# CORE ACCESS
-# ------------------------------------------------------
-
-
-def _core():
-    # ВАЖНО: импорт внутри функции — так мы избегаем циклических импортов
-    from findex_bot import bot
-    return bot
-
-
-def _get_pending_storage():
-    c = _core()
-    c.ADS_PENDING = getattr(c, "ADS_PENDING", {}) or {}
-    return c.ADS_PENDING
-
-
-def _get_rejected_storage():
-    c = _core()
-    c.ADS_REJECTED = getattr(c, "ADS_REJECTED", {}) or {}
-    return c.ADS_REJECTED
-
-
-def _get_published_storage():
-    """
-    В bot.py у тебя это называется PUBLISHED_POSTS.
-    Делаем совместимо: если где-то раньше было ADS_PUBLISHED — тоже поддержим.
-    """
-    c = _core()
-    if hasattr(c, "PUBLISHED_POSTS"):
-        c.PUBLISHED_POSTS = getattr(c, "PUBLISHED_POSTS", {}) or {}
-        return c.PUBLISHED_POSTS
-    c.ADS_PUBLISHED = getattr(c, "ADS_PUBLISHED", {}) or {}
-    return c.ADS_PUBLISHED
-
-
-def _get_mod_chat_id() -> Optional[int]:
-    try:
-        return int(_core().config.moderation_chat_id)
+            logger.exception(
+                "failed to sync original moderation message to published ad_id=%s mod_chat_id=%s mod_message_id=%s",
+                getattr(ad, "id", None),
+                mod_chat_id,
+                mod_message_id,
+            )
     except Exception:
+        logger.exception(
+            "sync original moderation published crashed ad_id=%s",
+            getattr(ad, "id", None),
+        )
+
+
+async def _sync_original_moderation_message_rejected(
+    *,
+    bot,
+    ad,
+    cb: CallbackQuery,
+    reason: str,
+) -> None:
+    """
+    Синхронизирует оригинальную карточку модерации, если reject был нажат
+    не на ней, а на её копии из /намодерации.
+    """
+    try:
+        payload = ad.payload or {}
+        mod_chat_id = int(payload.get("moderation_chat_id") or 0)
+        mod_message_id = int(payload.get("moderation_message_id") or 0)
+
+        if not mod_chat_id or not mod_message_id:
+            return
+
+        if cb.message:
+            try:
+                if (
+                    int(cb.message.chat.id) == mod_chat_id
+                    and int(cb.message.message_id) == mod_message_id
+                ):
+                    return
+            except Exception:
+                pass
+
+        add = f"\n\n❌ Отклонено\nМодератор: {_moderator_label(cb)}\nПричина: {reason}"
+
+        base = get_ad_text(ad)
+
+        author_username = str(payload.get("author_username") or "").strip()
+        author_name = str(payload.get("author_name") or "").strip()
+        author_id = payload.get("author_id") or getattr(ad, "author_user_id", None)
+
+        author_block = ""
+        if author_username:
+            author_block += f"\n\nАвтор: @{author_username}"
+        if author_id:
+            author_block += f"\nTelegram ID: {author_id}"
+        if author_name:
+            author_block += f"\nИмя: {author_name}"
+
+        try:
+            await bot.edit_message_caption(
+                chat_id=mod_chat_id,
+                message_id=mod_message_id,
+                caption=_safe_trunc_caption_1024((base or "").strip() + author_block + add),
+                reply_markup=None,
+            )
+            return
+        except Exception:
+            pass
+
+        try:
+            await bot.edit_message_text(
+                chat_id=mod_chat_id,
+                message_id=mod_message_id,
+                text=_safe_trunc_4096((base or "").strip() + author_block + add),
+                reply_markup=None,
+            )
+        except Exception:
+            logger.exception(
+                "failed to sync original moderation message to rejected ad_id=%s mod_chat_id=%s mod_message_id=%s",
+                getattr(ad, "id", None),
+                mod_chat_id,
+                mod_message_id,
+            )
+    except Exception:
+        logger.exception(
+            "sync original moderation rejected crashed ad_id=%s",
+            getattr(ad, "id", None),
+        )
+
+
+async def _delete_current_moderation_copy_if_needed(
+    *,
+    bot,
+    ad,
+    cb: CallbackQuery,
+) -> None:
+    """
+    Если действие выполнено на копии карточки из /намодерации,
+    удаляем эту копию после синхронизации оригинала.
+    Если действие было на оригинальной moderation-карточке, ничего не делаем.
+    """
+    try:
+        if not cb.message:
+            return
+
+        payload = ad.payload or {}
+        mod_chat_id = int(payload.get("moderation_chat_id") or 0)
+        mod_message_id = int(payload.get("moderation_message_id") or 0)
+
+        if not mod_chat_id or not mod_message_id:
+            return
+
+        current_chat_id = int(cb.message.chat.id)
+        current_message_id = int(cb.message.message_id)
+
+        if current_chat_id == mod_chat_id and current_message_id == mod_message_id:
+            return
+
+        try:
+            await bot.delete_message(
+                chat_id=current_chat_id,
+                message_id=current_message_id,
+            )
+        except Exception:
+            logger.exception(
+                "failed to delete moderation copy ad_id=%s current_chat_id=%s current_message_id=%s",
+                getattr(ad, "id", None),
+                current_chat_id,
+                current_message_id,
+            )
+    except Exception:
+        logger.exception(
+            "delete current moderation copy crashed ad_id=%s",
+            getattr(ad, "id", None),
+        )
+
+
+def _user_publish_footer(public_url: str | None, published: int | None, unlimited: bool) -> str:
+    url = public_url or "—"
+    s = "\n\n✅ Опубликовано\n" f"🔗 Ссылка: {url}\n"
+    if not unlimited and published is not None:
+        s += (
+            "\n"
+            f"📨 Публикации сегодня (UTC): {published}/{DAILY_FREE_LIMIT}\n\n"
+        )
+        if int(published) >= int(DAILY_FREE_LIMIT):
+            left = format_hhmmss(utc_seconds_to_reset())
+            s += f"⏳ До сброса (UTC): {left}\n\n"
+    else:
+        s += "\n"
+    s += "ℹ️ Чтобы создать новое объявление — нажми /start"
+    return s
+
+
+def _extract_preview_coords_from_payload(payload: dict[str, Any] | None) -> tuple[int, int, bool]:
+    from findex_bot.handlers.forms_parts.preview_ref_readers import extract_preview_coords_from_payload
+
+    return extract_preview_coords_from_payload(payload)
+
+
+def _extract_preview_coords_fallback_runtime(ad_id: int) -> tuple[int, int, bool]:
+    from findex_bot.handlers.forms_parts.preview_ref_readers import extract_preview_coords_fallback_runtime
+
+    return extract_preview_coords_fallback_runtime(ad_id, runtime_module=runtime)
+
+
+def _extract_value_from_ad_text(ad_text: str, label: str) -> str:
+    marker = f"{label}:"
+    for raw_line in (ad_text or "").splitlines():
+        line = (raw_line or "").strip()
+        if marker in line:
+            try:
+                return line.split(marker, 1)[1].strip()
+            except Exception:
+                continue
+    return ""
+
+
+def _strip_contacts_from_ad_text(ad_text: str) -> str:
+    """
+    Для публикации в основной канал скрываем строку с контактами,
+    если выбран способ отклика через бота.
+    Модерация при этом продолжает видеть полную карточку.
+    """
+    lines = []
+    for raw_line in (ad_text or "").splitlines():
+        line = (raw_line or "").strip()
+        if line.startswith("📞 Контакты:") or line.startswith("Контакты:"):
+            continue
+        lines.append(raw_line)
+
+    cleaned = "\n".join(lines)
+    while "\n\n\n" in cleaned:
+        cleaned = cleaned.replace("\n\n\n", "\n\n")
+    return cleaned.strip()
+
+
+def _contact_mode_key(value: Any) -> str:
+    return str(value or "").strip().lower()
+
+
+def _is_contact_mode_bot_only(value: Any) -> bool:
+    key = _contact_mode_key(value)
+    return key in {
+        _contact_mode_key(CONTACT_MODE_BOT),
+        "bot",
+        "tg_bot",
+        "telegram_bot",
+        "through_bot",
+        "via_bot",
+    }
+
+
+def _is_contact_mode_with_bot_button(value: Any) -> bool:
+    key = _contact_mode_key(value)
+    return key in {
+        _contact_mode_key(CONTACT_MODE_BOT),
+        _contact_mode_key(CONTACT_MODE_BOTH),
+        "bot",
+        "both",
+        "tg_bot",
+        "telegram_bot",
+        "through_bot",
+        "via_bot",
+    }
+
+
+def _published_compact_text(ad_text: str) -> str:
+    title = _extract_value_from_ad_text(ad_text, "Должность")
+    location = _extract_value_from_ad_text(ad_text, "Локация")
+
+    if title and location:
+        return f"✅ Опубликовано • {title} • {location}"
+    if title:
+        return f"✅ Опубликовано • {title}"
+    if location:
+        return f"✅ Опубликовано • {location}"
+    return "✅ Опубликовано"
+
+
+def _build_user_published_text(
+    *,
+    ad_text: str,
+    public_url: str | None,
+    published: int | None,
+    unlimited: bool,
+    collapsed: bool,
+) -> str:
+    if collapsed:
+        return _published_compact_text(ad_text)
+    return (ad_text or "").strip() + _user_publish_footer(public_url, published, unlimited)
+
+
+async def _resolve_published_count(author_id: int, unlimited: bool) -> Optional[int]:
+    if not author_id or unlimited:
+        return None
+    try:
+        async with get_sessionmaker()() as s:
+            published_count = await db_get_pub_count(s, int(author_id))
+            await s.commit()
+            return int(published_count)
+    except Exception:
+        logger.exception("failed to resolve published count for author_id=%s", author_id)
         return None
 
 
-def _get_main_channel_id() -> Optional[int]:
+
+
+async def _edit_user_preview_published(
+    *,
+    bot,
+    ad_id: int,
+    ad_text: str,
+    public_url: str | None,
+    published: int | None,
+    unlimited: bool,
+    payload: dict[str, Any] | None,
+    collapsed: bool = False,
+) -> None:
+    chat_id, msg_id, is_media = _extract_preview_coords_from_payload(payload)
+    if not chat_id or not msg_id:
+        chat_id, msg_id, is_media = _extract_preview_coords_fallback_runtime(ad_id)
+
+    if not chat_id or not msg_id:
+        logger.warning("preview coords not found for ad_id=%s (cannot edit user preview)", ad_id)
+        return
+
+    text = _build_user_published_text(
+        ad_text=ad_text,
+        public_url=public_url,
+        published=published,
+        unlimited=unlimited,
+        collapsed=collapsed,
+    )
+    kb = published_preview_kb(ad_id, collapsed=collapsed)
+
     try:
-        return int(_core().config.main_channel_id)
+        if is_media:
+            await bot.edit_message_caption(
+                chat_id=chat_id,
+                message_id=msg_id,
+                caption=_safe_trunc_caption_1024(text),
+                reply_markup=kb,
+            )
+        else:
+            await bot.edit_message_text(
+                chat_id=chat_id,
+                message_id=msg_id,
+                text=_safe_trunc_4096(text),
+                reply_markup=kb,
+                link_preview_options=LinkPreviewOptions(is_disabled=True),
+            )
+
+        try:
+            async with get_sessionmaker()() as s:
+                await AdRepo(s).patch_payload(
+                    int(ad_id),
+                    preview_status="published",
+                    preview_collapsed=bool(collapsed),
+                    preview_album_message_ids=[],
+                )
+                await s.commit()
+        except Exception:
+            logger.exception("failed to patch published preview payload ad_id=%s", ad_id)
+
     except Exception:
-        return None
+        logger.exception(
+            "failed to edit user preview to published state ad_id=%s chat_id=%s msg_id=%s",
+            ad_id,
+            chat_id,
+            msg_id,
+        )
 
 
-def _get_channel_username() -> str:
-    try:
-        return (_core().config.channel_username or "").lstrip("@")
-    except Exception:
-        return ""
 
 
-# ------------------------------------------------------
-# LIMITS (3 бесплатных в день) — БЕЗ циклического импорта
-# ------------------------------------------------------
+def _draft_preview_kb(role: str, ad_id: int) -> InlineKeyboardMarkup:
+    r = (role or "").strip().lower()
+    ad_id = int(ad_id)
 
+    if r == "seeker":
+        return InlineKeyboardMarkup(
+            inline_keyboard=[
+                [
+                    InlineKeyboardButton(text="Изменить Должность", callback_data=f"seek_edit_title:{ad_id}"),
+                    InlineKeyboardButton(text="Изменить Зарплата", callback_data=f"seek_edit_salary:{ad_id}"),
+                ],
+                [
+                    InlineKeyboardButton(text="Изменить График", callback_data=f"seek_edit_schedule:{ad_id}"),
+                    InlineKeyboardButton(text="Изменить Локация", callback_data=f"seek_edit_location:{ad_id}"),
+                ],
+                [
+                    InlineKeyboardButton(text="Изменить Контакты", callback_data=f"seek_edit_contacts:{ad_id}"),
+                ],
+                [
+                    InlineKeyboardButton(text="Изменить О себе", callback_data=f"seek_edit_about:{ad_id}"),
+                ],
+                [
+                    InlineKeyboardButton(text="Изменить Медиа", callback_data=f"seek_edit_media:{ad_id}"),
+                ],
+                [
+                    InlineKeyboardButton(text="✅ Отправить на модерацию", callback_data=f"send_seeker:{ad_id}"),
+                ],
+            ]
+        )
 
-def _limits_record_published(user_id: int) -> int | str | None:
-    """
-    Увеличивает счётчик ТОЛЬКО после успешной публикации.
-    Возвращает сколько осталось (0..3) или "∞".
-    """
-    try:
-        c = _core()
-        fn = getattr(c, "record_published", None)
-        if callable(fn):
-            return fn(int(user_id))
-    except Exception:
-        logger.exception("LIMITS: record_published failed user_id=%s", user_id)
-    return None
-
-
-def _limits_get_remaining(user_id: int) -> int | str | None:
-    """Сколько осталось сегодня (не увеличивает)."""
-    try:
-        c = _core()
-        fn = getattr(c, "get_remaining_today", None)
-        if callable(fn):
-            return fn(int(user_id))
-    except Exception:
-        logger.exception("LIMITS: get_remaining_today failed user_id=%s", user_id)
-    return None
-
-
-# ------------------------------------------------------
-# PARSERS
-# ------------------------------------------------------
-
-
-def _parse_ad_id(data: str) -> Optional[str]:
-    """
-    Поддержка:
-    mod_approve:<ad_id>
-    mod_reject:<ad_id>
-    open_post:<ad_id>
-    а также варианты с | и _
-    """
-    if not data:
-        return None
-    for sep in (":", "|", "_"):
-        if sep in data:
-            p = data.split(sep, 1)
-            if len(p) == 2 and p[1].strip():
-                return p[1].strip()
-    return None
-
-
-def _parse_mod_reason(data: str) -> Tuple[Optional[str], Optional[str]]:
-    """
-    mod_reason:<ad_id>:<field>
-    """
-    if not data or not data.startswith("mod_reason:"):
-        return None, None
-    parts = data.split(":")
-    if len(parts) >= 3:
-        return (parts[1].strip() or None, parts[2].strip() or None)
-    return None, None
-
-
-# ------------------------------------------------------
-# UI: LOCKED KEYBOARD (после отправки на модерацию)
-# ------------------------------------------------------
-
-
-def _locked_keyboard() -> InlineKeyboardMarkup:
-    # Одна кнопка-заглушка, остальные кнопки исчезают → редактирование невозможно
     return InlineKeyboardMarkup(
         inline_keyboard=[
-            [InlineKeyboardButton(text="⏳ Объявление отправлено на модерацию", callback_data=NOOP_CALLBACK)]
+            [
+                InlineKeyboardButton(text="Изменить Должность", callback_data=f"emp_edit_title:{ad_id}"),
+                InlineKeyboardButton(text="Изменить Зарплата", callback_data=f"emp_edit_salary:{ad_id}"),
+            ],
+            [
+                InlineKeyboardButton(text="Изменить Локация", callback_data=f"emp_edit_location:{ad_id}"),
+                InlineKeyboardButton(text="Изменить Контакты", callback_data=f"emp_edit_contacts:{ad_id}"),
+            ],
+            [
+                InlineKeyboardButton(text="Изменить Описание", callback_data=f"emp_edit_description:{ad_id}"),
+            ],
+            [
+                InlineKeyboardButton(text="Изменить Медиа", callback_data=f"emp_edit_media:{ad_id}"),
+            ],
+            [
+                InlineKeyboardButton(text="✅ Отправить на модерацию", callback_data=f"send_employer:{ad_id}"),
+            ],
         ]
     )
 
 
-# ------------------------------------------------------
-# NOOP (кнопка заблокирована)
-# ------------------------------------------------------
+@router.callback_query(F.data.startswith("pubpv_toggle:"))
+async def toggle_published_preview(cb: CallbackQuery):
+    await safe_answer(cb)
 
-
-@router.callback_query(F.data == NOOP_CALLBACK)
-async def noop_callback(callback: CallbackQuery):
-    await _safe_answer(callback, "⏳ Уже отправлено на модерацию", show_alert=True)
-
-
-# ------------------------------------------------------
-# SEND TO MODERATION (ANTI-SPAM + сохраняем полный предпросмотр)
-# ------------------------------------------------------
-
-
-@router.callback_query(F.data.in_(["seek_send_mod", "emp_send_mod"]))
-async def send_to_moderation(callback: CallbackQuery, state: FSMContext):
-    await _safe_answer(callback)
-
-    data = await state.get_data()
-    if data.get("on_moderation"):
-        await _safe_answer(callback, "⏳ Уже отправлено на модерацию", show_alert=True)
+    if not cb.message:
         return
 
-    mod_chat_id = _get_mod_chat_id()
-    if not mod_chat_id:
-        return
+    parts = (cb.data or "").split(":")
+    if len(parts) != 3:
+        if ctype == "private":
+            log_event(
+                logger,
+                "private_reject_reason",
+                user_id=cb.from_user.id,
+                callback_data=cb.data,
+                chat_type=ctype,
+                result="fail",
+            )
+        return await safe_answer(cb, "⚠️ Некорректные данные", alert=True)
 
-    ad_id = uuid.uuid4().hex[:12]
-
-    payload = dict(data)
-    payload["author_id"] = callback.from_user.id
-
-    # сохраняем, какое сообщение у пользователя является предпросмотром (чтобы потом обновить ЕГО)
-    payload["user_chat_id"] = callback.from_user.id
-    payload["user_message_id"] = callback.message.message_id
-    payload["user_has_caption"] = (getattr(callback.message, "caption", None) is not None)
-
-    role = payload.get("role", "Работодатель")
-    payload["role"] = role
-
-    _get_pending_storage()[ad_id] = payload
-
-    # 1) в мод-чат — полноценная карточка
-    await send_ad_preview(
-        chat_id=mod_chat_id,
-        ad_data=payload,
-        bot=callback.bot,
-        reply_markup=moderation_keyboard(ad_id),
-    )
-
-    # 2) блокируем повторную отправку
-    await state.update_data(on_moderation=True)
-
-    # 3) У пользователя: ЛОЧИМ ВСЕ КНОПКИ ОДНОЙ ЗАГЛУШКОЙ (по задаче)
-    original_text = _get_msg_text_or_caption(callback)
-    if not original_text:
-        try:
-            from findex_bot.utils.vacancy_utils import get_ad_text
-            original_text = get_ad_text(payload, include_author=False)
-        except Exception:
-            original_text = "⏳ Объявление отправлено на модерацию"
-
-    await _safe_edit(
-        callback,
-        original_text,
-        reply_markup=_locked_keyboard(),
-        parse_mode=ParseMode.HTML,
-        disable_preview=True,
-        allow_fallback=True,  # пользователю можно fallback
-    )
-
-
-# ------------------------------------------------------
-# MODERATION: APPROVE
-# ------------------------------------------------------
-
-
-@router.callback_query(F.data.startswith("mod_approve"))
-async def mod_approve_callback(callback: CallbackQuery, state: FSMContext):
-    await _safe_answer(callback)
-
-    ad_id = _parse_ad_id(callback.data or "")
-    if not ad_id:
-        return
-
-    pending = _get_pending_storage()
-    ad = pending.get(ad_id)
-    if not ad:
-        return
-
-    main_channel = _get_main_channel_id()
-    if not main_channel:
-        return
-
-    # текст объявления
     try:
-        from findex_bot.utils.vacancy_utils import get_ad_text
-        text = get_ad_text(ad, include_author=False)
+        ad_id = int(parts[1])
     except Exception:
-        text = ""
+        if ctype == "private":
+            log_event(
+                logger,
+                "private_reject_reason",
+                user_id=cb.from_user.id,
+                callback_data=cb.data,
+                chat_type=ctype,
+                result="fail",
+            )
+        return await safe_answer(cb, "⚠️ Некорректные данные", alert=True)
 
-    # публикуем (с медиа, если оно есть)
-    media_id = ad.get("media_id")
-    media_type = ad.get("media_type")
+    action = (parts[2] or "").strip().lower()
+    if action not in {"collapse", "expand"}:
+        return await safe_answer(cb, "⚠️ Некорректные данные", alert=True)
 
-    if media_id and media_type == "photo":
-        sent = await callback.bot.send_photo(
-            chat_id=main_channel,
-            photo=media_id,
-            caption=text,
-            parse_mode=ParseMode.HTML,
-        )
-    elif media_id and media_type == "video":
-        sent = await callback.bot.send_video(
-            chat_id=main_channel,
-            video=media_id,
-            caption=text,
-            parse_mode=ParseMode.HTML,
-        )
-    else:
-        sent = await callback.bot.send_message(
-            chat_id=main_channel,
-            text=text,
-            parse_mode=ParseMode.HTML,
-        )
+    collapsed = action == "collapse"
 
-    username = _get_channel_username()
-    url = f"https://t.me/{username}/{sent.message_id}" if username else ""
+    async with get_sessionmaker()() as session:
+        repo = AdRepo(session)
+        ad = await repo.get(ad_id)
+        if not ad:
+            log_event(
+                logger,
+                "moderation_reject_reason",
+                moderator_user_id=cb.from_user.id,
+                callback_data=cb.data,
+                ad_id=ad_id,
+                field_key=field,
+                result="not_found",
+            )
+            return await safe_answer(cb, "❌ Объявление не найдено", alert=True)
 
-    _get_published_storage()[ad_id] = {
-        "chat_id": main_channel,
-        "message_id": sent.message_id,
-        "url": url,
-    }
+        author_id = int(getattr(ad, "author_user_id", 0) or 0)
+        if author_id != int(cb.from_user.id):
+            return await safe_answer(cb, "⛔️ Нет доступа", alert=True)
 
-    # ✅ фиксируем лимит ПОСЛЕ успешной публикации
-    author_id = ad.get("author_id") or ad.get("user_chat_id")
-    remaining_after = None
-    if author_id:
-        remaining_after = _limits_record_published(int(author_id))
+        if getattr(ad, "status", None) != "published":
+            return await safe_answer(cb, "⚠️ Это объявление сейчас не опубликовано", alert=True)
 
-    # --------------------------------------------------
-    # 1) ОБНОВЛЯЕМ ПРЕДПРОСМОТР У ПОЛЬЗОВАТЕЛЯ (В ЭТОМ ЖЕ СООБЩЕНИИ)
-    #    reply_markup=None (после публикации кнопки не нужны)
-    # --------------------------------------------------
+        try:
+            new_message_id, new_is_media = await _replace_published_preview_message(
+                bot=cb.bot,
+                ad=ad,
+                collapsed=collapsed,
+                current_chat_id=int(cb.message.chat.id),
+                current_message_id=int(cb.message.message_id),
+            )
+        except Exception:
+            logger.exception("failed to toggle published preview ad_id=%s collapsed=%s", ad_id, collapsed)
+            return await safe_answer(cb, "❌ Не удалось обновить карточку", alert=True)
+
+        try:
+            await repo.patch_payload(
+                ad_id,
+                preview_chat_id=int(cb.message.chat.id),
+                preview_message_id=int(new_message_id),
+                preview_is_media=bool(new_is_media),
+                preview_album_message_ids=[],
+                preview_collapsed=bool(collapsed),
+                preview_status="published",
+            )
+            await session.commit()
+        except Exception:
+            logger.exception(
+                "failed to patch payload after published preview toggle ad_id=%s collapsed=%s new_message_id=%s",
+                ad_id,
+                collapsed,
+                new_message_id,
+            )
+
+
+@router.callback_query(F.data.startswith("republish:"))
+async def republish_from_preview(cb: CallbackQuery):
+    await safe_answer(cb)
+
     try:
-        user_chat_id = ad.get("user_chat_id") or ad.get("author_id")
-        user_message_id = ad.get("user_message_id")
-        user_has_caption = bool(ad.get("user_has_caption"))
+        ad_id = int((cb.data or "").split(":")[1])
+    except Exception:
+        return await safe_answer(cb, "⚠️ Некорректные данные", alert=True)
 
-        parts = []
-        parts.append("✅ <b>Опубликовано</b>")
+    author_id = int(cb.from_user.id)
 
-        if url:
-            parts.append(f"🔗 Ссылка: {url}")
+    async with get_sessionmaker()() as session:
+        repo = AdRepo(session)
+        src = await repo.get(ad_id)
+        if not src:
+            return await safe_answer(cb, "❌ Объявление не найдено", alert=True)
 
-        if remaining_after is None and user_chat_id:
-            remaining_after = _limits_get_remaining(int(user_chat_id))
+        if int(getattr(src, "author_user_id", 0) or 0) != author_id:
+            return await safe_answer(cb, "⛔️ Нет доступа", alert=True)
 
-        if remaining_after is not None:
-            if remaining_after == "∞":
-                parts.append("📩 Бесплатные публикации сегодня: ∞")
-            else:
-                parts.append(f"📩 Бесплатные публикации сегодня: {int(remaining_after)}/3")
+        if getattr(src, "status", None) != "published":
+            return await safe_answer(cb, "⚠️ Это объявление сейчас не опубликовано", alert=True)
 
-        parts.append("ℹ️ Чтобы создать новое объявление — нажми /start")
+        new_ad = await repo.clone_for_republish(source_ad_id=ad_id, author_user_id=author_id)
+        if not new_ad:
+            return await safe_answer(cb, "❌ Не удалось создать копию", alert=True)
 
-        status_user = "\n\n" + "\n\n".join(parts)
-        final_text = (text or "").strip() + status_user
+        payload = new_ad.payload or {}
+        role = resolve_ad_role(new_ad)
+        kb = _draft_preview_kb(role, int(new_ad.id))
 
-        if user_chat_id and user_message_id:
-            if user_has_caption:
-                await callback.bot.edit_message_caption(
-                    chat_id=int(user_chat_id),
-                    message_id=int(user_message_id),
-                    caption=final_text,
-                    parse_mode=ParseMode.HTML,
-                    reply_markup=None,
+        text = get_ad_text(new_ad)
+        photo_file_id = _get_primary_photo_id(payload)
+        video_file_id = payload.get("video_file_id")
+
+        try:
+            if video_file_id:
+                msg = await cb.bot.send_video(
+                    author_id,
+                    video=video_file_id,
+                    caption=_safe_trunc_caption_1024(text),
+                    reply_markup=kb,
                 )
+                is_media = True
+            elif photo_file_id:
+                msg = await cb.bot.send_photo(
+                    author_id,
+                    photo=photo_file_id,
+                    caption=_safe_trunc_caption_1024(text),
+                    reply_markup=kb,
+                )
+                is_media = True
             else:
-                await callback.bot.edit_message_text(
-                    chat_id=int(user_chat_id),
-                    message_id=int(user_message_id),
-                    text=final_text,
-                    parse_mode=ParseMode.HTML,
-                    reply_markup=None,
+                msg = await cb.bot.send_message(
+                    author_id,
+                    _safe_trunc_4096(text),
+                    reply_markup=kb,
                     link_preview_options=LinkPreviewOptions(is_disabled=True),
                 )
-    except Exception:
-        logger.exception(
-            "APPROVE: failed to update user preview ad_id=%s user_chat_id=%s user_message_id=%s user_has_caption=%s",
-            ad_id,
-            ad.get("user_chat_id"),
-            ad.get("user_message_id"),
-            ad.get("user_has_caption"),
+                is_media = False
+        except Exception:
+            logger.exception("failed to send new preview for republish new_ad_id=%s", getattr(new_ad, "id", None))
+            return await safe_answer(cb, "❌ Ошибка. Не смог отправить предпросмотр", alert=True)
+
+        await repo.patch_payload(
+            int(new_ad.id),
+            preview_chat_id=int(msg.chat.id),
+            preview_message_id=int(msg.message_id),
+            preview_is_media=bool(is_media),
+            preview_album_message_ids=[],
+            preview_status="draft",
+            preview_collapsed=False,
         )
 
-    # --------------------------------------------------
-    # 2) В МОД-ЧАТЕ ОБНОВЛЯЕМ СООБЩЕНИЕ СТАТУСОМ (служебно, как и было)
-    # --------------------------------------------------
-    moderator_u = callback.from_user.username
-    moderator_text = f"@{moderator_u}" if moderator_u else f"id{callback.from_user.id}"
-
-    status_mod = (
-        "✅ Опубликовано!\n"
-        f"Модератор: {moderator_text}\n"
-        f"Ссылка: {url}"
-    )
-
-    new_text = _append_once(_get_msg_text_or_caption(callback), status_mod)
-
-    await _safe_edit(
-        callback,
-        new_text,
-        reply_markup=None,
-        parse_mode=ParseMode.HTML,
-        disable_preview=True,
-        allow_fallback=False,  # мод-чат — никаких новых сообщений
-    )
-
-    pending.pop(ad_id, None)
+    return await safe_answer(cb, "✅ Сделал копию. Новый предпросмотр отправлен в личку.", alert=True)
 
 
-# ------------------------------------------------------
-# MODERATION: REJECT (меняем только клавиатуру причин)
-# ------------------------------------------------------
+@router.callback_query(F.data.startswith("priv_reject:"))
+async def reject_ad(callback: CallbackQuery):
+    from findex_bot.utils.obs import log_event
 
-
-@router.callback_query(F.data.startswith("mod_reject"))
-async def mod_reject_callback(callback: CallbackQuery, state: FSMContext):
-    await _safe_answer(callback)
-
-    ad_id = _parse_ad_id(callback.data or "")
-    if not ad_id:
-        return
-
-    await state.clear()
-    await state.update_data(mod_reject_ad_id=ad_id)
+    await safe_answer(callback)
+    ctype = _chat_type_str(callback)
 
     try:
-        await callback.message.edit_reply_markup(reply_markup=rejection_keyboard(ad_id))
+        ad_id = int((callback.data or "").split(":")[1])
     except Exception:
-        original = _get_msg_text_or_caption(callback)
-        await _safe_edit(
-            callback,
-            original,
-            reply_markup=rejection_keyboard(ad_id),
-            parse_mode=ParseMode.HTML,
-            disable_preview=True,
-            allow_fallback=False,  # мод-чат
+        if ctype == "private":
+            log_event(
+                logger,
+                "private_reject_open",
+                user_id=callback.from_user.id,
+                callback_data=callback.data,
+                chat_type=ctype,
+                result="fail",
+            )
+        else:
+            log_event(
+                logger,
+                "moderation_reject_open",
+                moderator_user_id=callback.from_user.id,
+                callback_data=callback.data,
+                result="fail",
+            )
+        return await safe_answer(callback, "⚠️ Некорректные данные", alert=True)
+
+    async with get_sessionmaker()() as session:
+        ad = await AdRepo(session).get(ad_id)
+        if not ad:
+            if ctype == "private":
+                log_event(
+                    logger,
+                    "private_reject_not_found",
+                    user_id=callback.from_user.id,
+                    callback_data=callback.data,
+                    ad_id=ad_id,
+                    chat_type=ctype,
+                    result="not_found",
+                )
+            else:
+                log_event(
+                    logger,
+                    "moderation_reject_open",
+                    moderator_user_id=callback.from_user.id,
+                    callback_data=callback.data,
+                    ad_id=ad_id,
+                    result="not_found",
+                )
+            return await safe_answer(callback, "❌ Объявление не найдено", alert=True)
+
+        payload = ad.payload or {}
+
+        role = str(payload.get("role") or payload.get("ad_role") or "").strip().lower()
+        if role not in {"seeker", "employer"}:
+            role = resolve_ad_role(ad)
+
+        # Жёсткая защита: если в moderation-карточке явно написана роль — верим ей
+        try:
+            raw = str((callback.message.text or callback.message.caption or "") if callback.message else "")
+            raw_l = raw.lower()
+            if "соискатель" in raw_l:
+                role = "seeker"
+            elif "работодатель" in raw_l:
+                role = "employer"
+        except Exception:
+            pass
+
+        if role not in {"seeker", "employer"}:
+            role = "employer"
+
+        try:
+            await AdRepo(session).patch_payload(ad_id, role=role, ad_role=role)
+        except Exception:
+            pass
+
+        try:
+            if callback.message:
+                await callback.message.edit_reply_markup(
+                    reply_markup=rejection_keyboard(ad_id, role)
+                )
+        except Exception:
+            pass
+
+    if ctype == "private":
+        log_event(
+            logger,
+            "private_reject_open",
+            user_id=callback.from_user.id,
+            callback_data=callback.data,
+            ad_id=ad_id,
+            role=role,
+            chat_type=ctype,
+            result="ok",
+        )
+    else:
+        log_event(
+            logger,
+            "moderation_reject_open",
+            moderator_user_id=callback.from_user.id,
+            callback_data=callback.data,
+            ad_id=ad_id,
+            role=role,
+            result="ok",
         )
 
-
-# ------------------------------------------------------
-# MODERATION: REASON → отклоняем и возвращаем автору на правку
-# ------------------------------------------------------
+    return await safe_answer(callback, "Выбери причину отклонения", alert=True)
 
 
-def _reason_text(field: str) -> str:
-    m = {
-        "position": "Должность некорректная",
-        "schedule": "График некорректный",
-        "salary": "Зарплата некорректная",
-        "location": "Локация некорректная",
-        "contacts": "Контакты некорректные",
-        "description": "Описание неправильное",
-        "custom": "Другая причина",
-    }
-    return m.get(field, "Другая причина")
-
-
-def _make_fix_keyboard(ad_id: str, field: str) -> InlineKeyboardMarkup:
-    titles = {
-        "position": "Должность",
+def _field_title_local(field_key: str) -> str:
+    k = (field_key or "").strip().lower()
+    mapping = {
+        "title": "Должность",
         "schedule": "График",
         "salary": "Зарплата",
         "location": "Локация",
         "contacts": "Контакты",
         "description": "Описание",
-        "custom": "Другое",
+        "about": "О себе",
+        "media": "Медиа",
     }
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
-            [
-                InlineKeyboardButton(
-                    text=f"✏️ Исправить: {titles.get(field, 'Поле')}",
-                    callback_data=f"fix_rej:{ad_id}:{field}",
-                )
-            ]
-        ]
-    )
+    return mapping.get(k, "Поле")
 
 
-@router.callback_query(F.data.startswith("mod_reason:"))
-async def mod_reason_callback(callback: CallbackQuery, state: FSMContext):
-    await _safe_answer(callback)
+def _prompt_for(role: str, field: str) -> tuple[str, Any]:
+    from findex_bot.states.vacancies import EmployerForm, SeekerForm
 
-    ad_id, field = _parse_mod_reason(callback.data or "")
-    if not ad_id:
-        st = await state.get_data()
-        ad_id = st.get("mod_reject_ad_id")
+    r = (role or "").strip().lower()
+    f = (field or "").strip().lower()
 
-    if not ad_id:
-        return
-
-    field = (field or "custom").lower().strip()
-    reason = _reason_text(field)
-
-    pending = _get_pending_storage()
-    ad = pending.get(ad_id)
-    if not ad:
-        await state.clear()
-        return
-
-    author_id = ad.get("author_id")
-
-    _get_rejected_storage()[ad_id] = ad
-    pending.pop(ad_id, None)
-
-    if author_id:
-        try:
-            await callback.bot.send_message(
-                chat_id=int(author_id),
-                text=(
-                    "❌ Объявление отклонено модератором.\n\n"
-                    f"Причина: <b>{reason}</b>\n\n"
-                    "Нажми кнопку ниже, чтобы сразу исправить."
-                ),
-                parse_mode=ParseMode.HTML,
-                reply_markup=_make_fix_keyboard(ad_id, field),
+    if r == "seeker":
+        if f == "title":
+            return ("Укажи 👤 должность.\n\nПример: Бариста, Официант, Администратор", SeekerForm.title)
+        if f == "schedule":
+            return ("Укажи 🕒 график.\n\nПример: 5/2, 2/2, Сменный, Гибкий, Удалёнка", SeekerForm.schedule)
+        if f == "salary":
+            return ("Укажи 💲 зарплатные ожидания.\n\nПример: от 80 000, 120 000, по договорённости", SeekerForm.salary)
+        if f == "location":
+            return ("Укажи 📍 локацию.\n\nПример: Москва, Химки, ЦАО / СПБ, Приморский", SeekerForm.location)
+        if f == "contacts":
+            return (
+                "Укажи 📞 контакты.\n\n"
+                "• Telegram: @username\n"
+                "• Телефон: +7 999 123-45-67\n"
+                "• Email: name@mail.com\n"
+                "• Любой удобный способ связи",
+                SeekerForm.contacts,
             )
-        except Exception:
-            pass
+        if f in ("about", "description"):
+            return (
+                "Укажи 📝 о себе.\n\nПример: опыт, навыки, чем полезен, условия (до 2000 символов)",
+                SeekerForm.description,
+            )
+        if f == "media":
+            return ("Добавить 🖼 фото?\n\nФото не обязательно.", SeekerForm.media_choice)
 
-    status = f"✖ Отклонено: причина — {reason}"
-    base = _get_msg_text_or_caption(callback)
-    new_text = _append_once(base, status)
+        return (
+            "Укажи 📝 о себе.\n\nПример: опыт, навыки, чем полезен, условия (до 2000 символов)",
+            SeekerForm.description,
+        )
 
-    await _safe_edit(
-        callback,
-        new_text,
-        reply_markup=None,
-        parse_mode=ParseMode.HTML,
-        disable_preview=True,
-        allow_fallback=False,
+    if f == "title":
+        return ("Укажи 👤 должность.\n\nПример: Бариста, Официант, Администратор", EmployerForm.title)
+    if f == "salary":
+        return ("Укажи 💲 зарплату.\n\nПример: от 80 000, 120 000, по договорённости", EmployerForm.salary)
+    if f == "location":
+        return ("Укажи 📍 локацию.\n\nПример: Москва, Химки, ЦАО / СПБ, Приморский", EmployerForm.location)
+    if f == "contacts":
+        return (
+            "Укажи 📞 контакты.\n\n"
+            "• Telegram: @username\n"
+            "• Телефон: +7 999 123-45-67\n"
+            "• Email: name@mail.com\n"
+            "• Любой удобный способ связи",
+            EmployerForm.contacts,
+        )
+    if f == "description":
+        return (
+            "Укажи 📝 описание.\n\nПример: обязанности, условия, требования (до 2000 символов)",
+            EmployerForm.description,
+        )
+    if f == "media":
+        return ("Добавить 🎞 медиа?\n\nФото или короткое видео (не обязательно).", EmployerForm.media_choice)
+
+    return (
+        "Укажи 📝 описание.\n\nПример: обязанности, условия, требования (до 2000 символов)",
+        EmployerForm.description,
     )
 
-    await state.clear()
+
+def _chat_type_str(cb: CallbackQuery) -> str:
+    try:
+        if not cb.message or not cb.message.chat:
+            return ""
+        return str(cb.message.chat.type)
+    except Exception:
+        return ""
 
 
-# ------------------------------------------------------
-# AUTHOR: FIX AFTER REJECTION → снимаем блокировку + force_preview
-# ------------------------------------------------------
+def _role_from_moderation_message(cb: CallbackQuery) -> str:
+    """
+    Пытаемся определить роль именно из moderation-сообщения.
+    Никаких дефолтов в employer тут быть не должно.
+    """
+    try:
+        if not cb.message:
+            return ""
+
+        raw = ""
+        try:
+            raw = str(cb.message.text or cb.message.caption or "")
+        except Exception:
+            raw = ""
+
+        text_l = raw.lower()
+
+        if "соискатель" in text_l:
+            return "seeker"
+
+        if "работодатель" in text_l:
+            return "employer"
+
+        return ""
+    except Exception:
+        logger.exception("failed to resolve role from moderation message")
+        return ""
 
 
-@router.callback_query(F.data.startswith("fix_rej:"))
-async def fix_rejected_ad(callback: CallbackQuery, state: FSMContext):
-    await _safe_answer(callback)
+@router.callback_query(F.data.startswith("priv_rejr:"))
+async def rejr_dispatch(cb: CallbackQuery, state: FSMContext):
+    from findex_bot.utils.obs import log_event
 
-    parts = (callback.data or "").split(":")
-    if len(parts) < 3:
-        return
+    await safe_answer(cb)
 
-    ad_id = parts[1].strip()
-    field = parts[2].strip().lower()
+    ctype = _chat_type_str(cb)
 
-    rejected = _get_rejected_storage()
-    ad_data = rejected.get(ad_id)
-    if not ad_data:
-        await _safe_answer(callback, "Объявление не найдено", show_alert=True)
-        return
-
-    role = ad_data.get("role", "Работодатель")
-
-    # ✅ Грузим данные, снимаем блокировку и включаем принудительный предпросмотр
-    await state.clear()
-    await state.update_data(**ad_data)
-    await state.update_data(on_moderation=False, is_inline_edit=True, force_preview=True)
-
-    if role == "Соискатель":
-        mapping = {
-            "position": SeekerForm.position,
-            "schedule": SeekerForm.schedule,
-            "salary": SeekerForm.salary,
-            "location": SeekerForm.location,
-            "contacts": SeekerForm.contacts,
-            "description": SeekerForm.description,
-        }
-    else:
-        mapping = {
-            "position": EmployerForm.position,
-            "salary": EmployerForm.salary,
-            "location": EmployerForm.location,
-            "contacts": EmployerForm.contacts,
-            "description": EmployerForm.description,
-        }
-
-    target_state = mapping.get(field)
-    if not target_state:
-        await _safe_answer(callback, "Поле не поддерживается", show_alert=True)
-        return
-
-    await state.set_state(target_state)
-
-    prompts = {
-        "position": "Введи исправленную 👤 должность:",
-        "schedule": "Введи исправленный 🕒 график:",
-        "salary": "Введи исправленную 💲 зарплату:",
-        "location": "Введи исправленную 📍 локацию:",
-        "contacts": "Введи исправленные ☎️ контакты:",
-        "description": "Введи исправленное 📝 описание:",
-        "custom": "Введи исправления:",
-    }
+    parts = (cb.data or "").split(":")
+    if len(parts) != 3:
+        return await safe_answer(cb, "⚠️ Некорректные данные", alert=True)
 
     try:
-        await callback.message.answer(prompts.get(field, "Введи исправленное значение:"))
+        ad_id = int(parts[1])
     except Exception:
+        return await safe_answer(cb, "⚠️ Некорректные данные", alert=True)
+
+    field = (parts[2] or "").strip().lower()
+
+    if ctype == "private":
+        async with get_sessionmaker()() as session:
+            repo = AdRepo(session)
+            ad = await repo.get(ad_id)
+            if not ad:
+                log_event(
+                    logger,
+                    "private_reject_not_found",
+                    user_id=cb.from_user.id,
+                    callback_data=cb.data,
+                    ad_id=ad_id,
+                    field=field,
+                    chat_type=ctype,
+                    result="not_found",
+                )
+                return await safe_answer(cb, "❌ Объявление не найдено", alert=True)
+
+            author_id = int(getattr(ad, "author_user_id", 0) or 0)
+            if author_id != int(cb.from_user.id):
+                log_event(
+                    logger,
+                    "private_reject_access_denied",
+                    user_id=cb.from_user.id,
+                    callback_data=cb.data,
+                    ad_id=ad_id,
+                    field=field,
+                    chat_type=ctype,
+                    result="denied",
+                )
+                return await safe_answer(cb, "⛔️ Нет доступа", alert=True)
+
+            payload = ad.payload or {}
+
+            try:
+                rid = int(payload.get("reject_notice_message_id") or 0)
+                rcid = int(payload.get("reject_notice_chat_id") or 0)
+                cb_mid = int(cb.message.message_id) if cb.message else 0
+                cb_cid = int(cb.message.chat.id) if cb.message else 0
+                logger.warning(
+                    "REJECT_NOTICE_DELETE_PROBE ad_id=%s field=%s rcid=%s rid=%s cb_cid=%s cb_mid=%s",
+                    ad_id, field, rcid, rid, cb_cid, cb_mid,
+                )
+                if rid > 0 and rcid > 0:
+                    await cb.bot.delete_message(chat_id=rcid, message_id=rid)
+                    logger.warning("REJECT_NOTICE_DELETE_OK ad_id=%s rid=%s", ad_id, rid)
+            except Exception:
+                logger.exception("REJECT_NOTICE_DELETE_FAIL ad_id=%s", ad_id)
+
+            forced_role = _role_from_moderation_message(cb)
+            payload_role = str(payload.get("role") or payload.get("ad_role") or "").strip().lower()
+            db_role = resolve_ad_role(ad)
+
+            if forced_role in {"seeker", "employer"}:
+                role = forced_role
+            elif payload_role in {"seeker", "employer"}:
+                role = payload_role
+            else:
+                role = db_role
+
+            if role not in {"seeker", "employer"}:
+                role = "employer"
+
+            log_event(
+                logger,
+                "private_reject_reason",
+                user_id=cb.from_user.id,
+                callback_data=cb.data,
+                ad_id=ad_id,
+                field=field,
+                role=role,
+                chat_type=ctype,
+                result="ok",
+            )
+
+            try:
+                stored_preview_msg_id = int(payload.get("preview_message_id") or 0)
+            except Exception:
+                stored_preview_msg_id = 0
+
+            try:
+                stored_preview_chat_id = int(payload.get("preview_chat_id") or cb.from_user.id or 0)
+            except Exception:
+                stored_preview_chat_id = int(cb.from_user.id)
+
+            stored_preview_is_media = bool(payload.get("preview_is_media") or False)
+
+        if cb.message:
+            try:
+                await cb.bot.delete_message(
+                    chat_id=int(cb.message.chat.id),
+                    message_id=int(cb.message.message_id),
+                )
+            except Exception:
+                logger.exception("failed to delete private reject notice ad_id=%s field=%s", ad_id, field)
+
         try:
-            await callback.bot.send_message(
-                chat_id=callback.from_user.id,
-                text=prompts.get(field, "Введи исправленное значение:"),
+            await state.clear()
+            await reset_cleanup_bucket(state)
+            await state.update_data(
+                ad_id=ad_id,
+                edit_mode=True,
+                preview_msg_id=(stored_preview_msg_id or None),
+                preview_is_media=stored_preview_is_media,
+                draft_cleanup_chat_id=(stored_preview_chat_id if stored_preview_msg_id else None),
+                draft_cleanup_ids=([int(stored_preview_msg_id)] if stored_preview_msg_id else []),
+            )
+            log_event(
+                logger,
+                "private_reject_prepare_edit",
+                user_id=cb.from_user.id,
+                callback_data=cb.data,
+                ad_id=ad_id,
+                field=field,
+                role=role,
+                chat_type=ctype,
+                result="ok",
             )
         except Exception:
-            pass
+            log_event(
+                logger,
+                "private_reject_prepare_edit",
+                user_id=cb.from_user.id,
+                callback_data=cb.data,
+                ad_id=ad_id,
+                field=field,
+                role=role,
+                chat_type=ctype,
+                result="fail",
+            )
+            logger.exception("failed to prepare edit state from rejection flow ad_id=%s field=%s", ad_id, field)
+
+        if cb.message:
+            try:
+                await cb.bot.delete_message(
+                    chat_id=cb.message.chat.id,
+                    message_id=cb.message.message_id,
+                )
+            except Exception:
+                await track_cleanup_message(state, cb.message)
+
+        if field == "media":
+            text, next_state = _prompt_for(role, field)
+            try:
+                await state.set_state(next_state)
+            except Exception:
+                logger.exception("failed to set FSM state for rejection media edit ad_id=%s field=%s", ad_id, field)
+
+            try:
+                if role == "seeker":
+                    sent = await cb.message.answer(
+                        f"✏️ Исправить: {_field_title_local(field)}\n\n{text}",
+                        reply_markup=seeker_media_choice_kb(),
+                    )
+                else:
+                    sent = await cb.message.answer(
+                        f"✏️ Исправить: {_field_title_local(field)}\n\n{text}",
+                        reply_markup=employer_media_choice_kb(),
+                    )
+                await track_cleanup_message(state, sent)
+            except Exception:
+                if cb.message:
+                    sent = await cb.message.answer(f"✏️ Исправить: {_field_title_local(field)}\n\n{text}")
+                    await track_cleanup_message(state, sent)
+            return
+
+        text, next_state = _prompt_for(role, field)
+        try:
+            await state.set_state(next_state)
+        except Exception:
+            logger.exception("failed to set FSM state for rejection edit ad_id=%s field=%s", ad_id, field)
+
+        if cb.message:
+            if field == "location":
+                sent = await cb.message.answer(
+                    f"✏️ Исправить: {_field_title_local(field)}\n\n{text}",
+                    reply_markup=metro_location_keyboard(),
+                )
+            else:
+                sent = await cb.message.answer(f"✏️ Исправить: {_field_title_local(field)}\n\n{text}")
+            await track_cleanup_message(state, sent)
+        return
+
+    field_reason_map = {
+        "title": "Должность некорректная",
+        "schedule": "График некорректный",
+        "salary": "Зарплата некорректная",
+        "location": "Локация некорректная",
+        "contacts": "Контакты некорректные",
+        "description": "Описание некорректное",
+        "about": "О себе некорректно",
+        "media": "Медиа/фото некорректное",
+    }
+    reason = field_reason_map.get(field, "Некорректные данные объявления")
+
+    async with get_sessionmaker()() as session:
+        repo = AdRepo(session)
+        ad = await repo.get(ad_id)
+        if not ad:
+            return await safe_answer(cb, "❌ Объявление не найдено", alert=True)
+
+        payload = ad.payload or {}
+        author_id = int(payload.get("author_id") or getattr(ad, "author_user_id", 0) or 0)
+
+        payload_role = str(payload.get("role") or payload.get("ad_role") or "").strip().lower()
+        db_role = resolve_ad_role(ad)
+        forced_role = _role_from_moderation_message(cb)
+
+        if forced_role in {"seeker", "employer"}:
+            final_role = forced_role
+        elif payload_role in {"seeker", "employer"}:
+            final_role = payload_role
+        else:
+            final_role = db_role
+
+        if final_role not in {"seeker", "employer"}:
+            final_role = "employer"
+
+        log_event(
+            logger,
+            "moderation_reject_reason",
+            moderator_user_id=cb.from_user.id,
+            callback_data=cb.data,
+            ad_id=ad_id,
+            field_key=field,
+            role=final_role,
+            result="ok",
+        )
+
+        patch_kwargs = {
+            "rejected_reason": reason,
+            "rejected_field": field,
+        }
+        if final_role in {"seeker", "employer"}:
+            patch_kwargs["role"] = final_role
+            patch_kwargs["ad_role"] = final_role
+
+        try:
+            await repo.set_status(ad_id, "draft")
+        except Exception:
+            logger.exception("failed to set ad draft status on rejection ad_id=%s field=%s", ad_id, field)
+
+        try:
+            await repo.patch_payload(ad_id, **patch_kwargs)
+        except Exception:
+            logger.exception("failed to patch rejection payload ad_id=%s field=%s", ad_id, field)
+
+    await _edit_moderation_message_rejected(cb, reason)
+
+    await _sync_original_moderation_message_rejected(
+        bot=cb.bot,
+        ad=ad,
+        cb=cb,
+        reason=reason,
+    )
+
+    await _delete_current_moderation_copy_if_needed(
+        bot=cb.bot,
+        ad=ad,
+        cb=cb,
+    )
+
+    if not author_id:
+        log_event(
+            logger,
+            "moderation_reject_notify",
+            moderator_user_id=cb.from_user.id,
+            ad_id=ad_id,
+            field_key=field,
+            result="fail",
+        )
+
+    try:
+        kb_fix = InlineKeyboardMarkup(
+            inline_keyboard=[
+                [InlineKeyboardButton(text=f"✏️ Исправить: {_field_title_local(field)}", callback_data=f"priv_rejr:{ad_id}:{field}")]
+            ]
+        )
+
+        rej_msg = await cb.bot.send_message(
+            author_id,
+            rejected_user_text(reason),
+            reply_markup=kb_fix,
+            parse_mode="HTML",
+            link_preview_options=LinkPreviewOptions(is_disabled=True),
+        )
+
+        log_event(
+            logger,
+            "moderation_reject_notify",
+            moderator_user_id=cb.from_user.id,
+            author_id=author_id,
+            ad_id=ad_id,
+            field_key=field,
+            result="ok",
+        )
+
+        try:
+            async with get_sessionmaker()() as s2:
+                await AdRepo(s2).patch_payload(
+                    ad_id,
+                    reject_notice_chat_id=int(rej_msg.chat.id),
+                    reject_notice_message_id=int(rej_msg.message_id),
+                )
+                await s2.commit()
+        except Exception:
+            logger.exception("failed to patch reject notice coords ad_id=%s author_id=%s", ad_id, author_id)
+    except Exception:
+        log_event(
+            logger,
+            "moderation_reject_notify",
+            moderator_user_id=cb.from_user.id,
+            author_id=author_id,
+            ad_id=ad_id,
+            field_key=field,
+            result="fail",
+        )
+        logger.exception("failed to notify user about rejection ad_id=%s author_id=%s", ad_id, author_id)
+
+    return await safe_answer(cb, "❌ Отклонено", alert=True)
+
+
+
+
+
+
+@router.callback_query(F.data.startswith("emp_edit_"))
+async def emp_quick_edit(cb: CallbackQuery, state: FSMContext):
+    await _start_edit_from_preview(cb, state)
+
+
+@router.callback_query(F.data.startswith("seek_edit_"))
+async def seek_quick_edit(cb: CallbackQuery, state: FSMContext):
+    await _start_edit_from_preview(cb, state)
+
+
+@router.callback_query(F.data.startswith("approve:"))
+async def approve_ad(callback: CallbackQuery):
+    await safe_answer(callback)
+
+    try:
+        ad_id = int((callback.data or "").split(":")[1])
+    except Exception:
+        return await safe_answer(callback, "⚠️ Некорректные данные", alert=True)
+
+    channel_id = int(getattr(runtime, "MAIN_CHANNEL_ID", 0) or 0)
+    channel_username = str(getattr(runtime, "CHANNEL_USERNAME", "") or "").lstrip("@").strip()
+
+    if channel_id == 0:
+        return await safe_answer(callback, "⚠️ MAIN_CHANNEL_ID не настроен", alert=True)
+
+    async with get_sessionmaker()() as session:
+        repo = AdRepo(session)
+        ad = await repo.get(ad_id)
+        if not ad:
+            return await safe_answer(callback, "❌ Объявление не найдено", alert=True)
+
+        if getattr(ad, "status", None) == "published":
+            try:
+                if callback.message:
+                    await callback.message.edit_reply_markup(reply_markup=None)
+            except Exception:
+                pass
+            return await safe_answer(callback, "⚠️ Уже опубликовано", alert=True)
+
+        payload = ad.payload or {}
+        author_id = payload.get("author_id") or getattr(ad, "author_user_id", None)
+        author_username = payload.get("author_username")
+
+        unlimited = is_unlimited(author_id, author_username)
+
+        if author_id and (not unlimited):
+            try:
+                async with get_sessionmaker()() as s2:
+                    published = await db_get_pub_count(s2, int(author_id))
+                    await s2.commit()
+            except Exception:
+                logger.exception("failed to pre-check daily publish count author_id=%s ad_id=%s", author_id, ad_id)
+                published = 0
+
+            if published >= int(DAILY_FREE_LIMIT):
+                left = format_hhmmss(utc_seconds_to_reset())
+                warn = (
+                    f"⛔️ Лимит публикаций исчерпан ({published}/{DAILY_FREE_LIMIT}).\n"
+                    f"До сброса (UTC): {left}"
+                )
+                try:
+                    await _send_limit_notice(callback.bot, int(author_id), warn)
+                except Exception:
+                    logger.exception("failed to send clean limit notice author_id=%s ad_id=%s", author_id, ad_id)
+
+                return await safe_answer(callback, "⛔ Лимит исчерпан (автору отправлено)", alert=True)
+
+        contact_mode = payload.get("contact_mode")
+        bot_only_mode = _is_contact_mode_bot_only(contact_mode)
+
+        text = get_ad_text(ad, include_contacts=not bot_only_mode)
+        photo_file_id = _get_primary_photo_id(payload)
+        video_file_id = payload.get("video_file_id")
+
+        if bot_only_mode:
+            text = _strip_contacts_from_ad_text(text)
+
+        kb = channel_ad_kb(ad.id) if _is_contact_mode_with_bot_button(contact_mode) else None
+
+        try:
+            if video_file_id:
+                msg = await callback.bot.send_video(channel_id, video=video_file_id, caption=text, reply_markup=kb)
+            elif photo_file_id:
+                msg = await callback.bot.send_photo(channel_id, photo=photo_file_id, caption=text, reply_markup=kb)
+            else:
+                msg = await callback.bot.send_message(channel_id, text, reply_markup=kb)
+        except Exception:
+            logger.exception("publish failed")
+            return await safe_answer(callback, "❌ Ошибка публикации", alert=True)
+
+        public_url: Optional[str] = None
+        if channel_username:
+            public_url = f"https://t.me/{channel_username}/{msg.message_id}"
+
+        published_after: Optional[int] = None
+        if author_id and (not unlimited):
+            try:
+                async with get_sessionmaker()() as s3:
+                    published_after = int(await db_inc_pub_count(s3, int(author_id)))
+                    await s3.commit()
+            except Exception:
+                logger.exception("failed to increment daily publish count author_id=%s ad_id=%s", author_id, ad_id)
+                published_after = None
+
+        await repo.set_status(ad.id, "published")
+        await repo.set_public_url(ad.id, public_url)
+
+        await _edit_moderation_message_published(callback, public_url)
+
+        await _sync_original_moderation_message_published(
+            bot=callback.bot,
+            ad=ad,
+            cb=callback,
+            public_url=public_url,
+        )
+
+        await _delete_current_moderation_copy_if_needed(
+            bot=callback.bot,
+            ad=ad,
+            cb=callback,
+        )
+
+        try:
+            await _edit_user_preview_published(
+                bot=callback.bot,
+                ad_id=ad.id,
+                ad_text=get_ad_text(ad),
+                public_url=public_url,
+                published=published_after,
+                unlimited=unlimited,
+                payload=payload,
+                collapsed=False,
+            )
+        except Exception:
+            logger.exception("edit user preview failed for ad_id=%s", ad.id)
+
+        try:
+            await fire_alerts_on_publish(callback.bot, ad, url=public_url)
+        except Exception:
+            logger.exception("alerts failed")
+
+    return await safe_answer(callback, "✅ Опубликовано", alert=True)

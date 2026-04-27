@@ -1,0 +1,53 @@
+services:
+  bot:
+    build:
+      context: /Users/tmkd/Desktop/tmkd/FindexHub
+      dockerfile: Dockerfile
+    env_file:
+      - ./main.env
+    command: python -m findex_bot.bot
+    restart: unless-stopped
+    networks:
+      - main_runtime
+    depends_on: []
+
+  jobs:
+    build:
+      context: /Users/tmkd/Desktop/tmkd/FindexHub
+      dockerfile: Dockerfile
+    env_file:
+      - ./main.env
+    command: python -m findex_bot.jobs
+    restart: unless-stopped
+    networks:
+      - main_runtime
+    depends_on: []
+
+  resurrection:
+    build:
+      context: /Users/tmkd/Desktop/tmkd/FindexHub
+      dockerfile: Dockerfile
+    env_file:
+      - ./main.env
+    command: python -m findex_bot.resurrection_worker
+    restart: unless-stopped
+    networks:
+      - main_runtime
+    depends_on: []
+
+  support:
+    build:
+      context: /Users/tmkd/Desktop/tmkd/FindexHub
+      dockerfile: Dockerfile
+    env_file:
+      - ./main.env
+    command: python support_bot/support_bot.py
+    restart: unless-stopped
+    networks:
+      - main_runtime
+    depends_on: []
+
+networks:
+  main_runtime:
+    external: true
+    name: findexhub_internal
