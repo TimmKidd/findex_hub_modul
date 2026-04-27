@@ -23,3 +23,4 @@ supervisord.conf
 supervisord.log
 
 tests/
+support_bot/venv/
