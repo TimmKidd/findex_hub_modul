@@ -5,7 +5,7 @@ import contextlib
 import logging
 
 from typing import Optional, Any
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 
 from aiogram import Router, F
 from aiogram.filters import Command
@@ -33,6 +33,7 @@ from findex_bot.utils.ui_utils import (
 
 from findex_bot.handlers.start import show_roles
 from findex_bot.utils.obs import log_event
+from findex_bot.utils import alerts as alerts_utils
 
 router = Router()
 logger = logging.getLogger(__name__)
@@ -41,6 +42,7 @@ CB_DIAG = "menu_diag"
 CB_DIAG_BACK = "menu_diag_back"
 CB_START = "menu_start"
 CB_ALERTS = "alerts_open"
+CB_LIMITS = "menu_limits"
 CB_REFRESH = "menu_refresh"
 CB_DIAG_PENDING_OPEN = "diag_pending_open"
 
@@ -69,6 +71,7 @@ def _menu_kb(channel_username: str) -> InlineKeyboardMarkup:
     rows: list[list[InlineKeyboardButton]] = [
         [InlineKeyboardButton(text="📩 Мои отклики", callback_data=CB_RESPONDS_ROOT)],
         [InlineKeyboardButton(text="🔔 Мои уведомления", callback_data=CB_ALERTS)],
+        [InlineKeyboardButton(text="📊 Мои лимиты", callback_data=CB_LIMITS)],
         [InlineKeyboardButton(text="🛠 Диагностика", callback_data=CB_DIAG)],
         [InlineKeyboardButton(text="🆘 Support", url="https://t.me/Findex_support_bot")],
         [InlineKeyboardButton(text="📣 Канал - обязательная подписка", url=channel_url)],
@@ -781,6 +784,90 @@ async def _send_or_edit_menu(target: Message | CallbackQuery):
     )
 
 
+
+RESPOND_DAILY_LIMIT = 12
+RESPOND_DAILY_KEY_TEMPLATE = "respond:daily:{user_id}:{day}"
+
+
+def _limits_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="↩️ В меню", callback_data=CB_DIAG_BACK)],
+        ]
+    )
+
+
+def _respond_daily_key(user_id: int) -> str:
+    tz = timezone(timedelta(hours=3))
+    day_key = datetime.now(tz).strftime("%Y%m%d")
+    return RESPOND_DAILY_KEY_TEMPLATE.format(user_id=int(user_id), day=day_key)
+
+
+async def _my_limits_text(user_id: int, username: str | None = None) -> str:
+    respond_used = 0
+    try:
+        r = getattr(runtime, "REDIS", None)
+        if r is not None:
+            raw = await r.get(_respond_daily_key(int(user_id)))
+            respond_used = int(raw or 0)
+    except Exception:
+        respond_used = 0
+
+    respond_left = max(RESPOND_DAILY_LIMIT - respond_used, 0)
+
+    pub_used = 0
+    try:
+        async with get_sessionmaker()() as session:
+            pub_used = await db_get_pub_count(session, int(user_id))
+            await session.commit()
+    except Exception:
+        pub_used = 0
+
+    pub_limit = int(DAILY_FREE_LIMIT)
+    pub_left = max(pub_limit - int(pub_used), 0)
+
+    seeker_used = 0
+    employer_used = 0
+    seeker_limit = 1
+    employer_limit = 1
+    try:
+        alerts = await alerts_utils.get_user_alerts(int(user_id))
+        seeker_used = len(alerts_utils.active_alerts_for_role(alerts, alerts_utils.ROLE_SEEKER))
+        employer_used = len(alerts_utils.active_alerts_for_role(alerts, alerts_utils.ROLE_EMPLOYER))
+        seeker_limit = int(alerts_utils.get_max_alerts(int(user_id), alerts_utils.ROLE_SEEKER))
+        employer_limit = int(alerts_utils.get_max_alerts(int(user_id), alerts_utils.ROLE_EMPLOYER))
+    except Exception:
+        pass
+
+    reset_left = format_hhmmss(utc_seconds_to_reset())
+
+    return (
+        "📊 <b>Мои лимиты</b>\n\n"
+        "📩 <b>Отклики сегодня</b>\n"
+        f"Использовано: <b>{respond_used}</b> из <b>{RESPOND_DAILY_LIMIT}</b>\n"
+        f"Осталось: <b>{respond_left}</b>\n"
+        f"Сброс через: <b>{reset_left}</b>\n\n"
+        "📢 <b>Публикации сегодня</b>\n"
+        f"Использовано: <b>{pub_used}</b> из <b>{pub_limit}</b>\n"
+        f"Осталось: <b>{pub_left}</b>\n"
+        f"Сброс через: <b>{reset_left}</b>\n\n"
+        "🔔 <b>Уведомления</b>\n"
+        f"👤 Соискатель: <b>{seeker_used}</b> из <b>{seeker_limit}</b>\n"
+        f"💼 Работодатель: <b>{employer_used}</b> из <b>{employer_limit}</b>"
+    )
+
+
+async def _send_or_edit_limits(target: Message | CallbackQuery):
+    user = target.from_user
+    text = await _my_limits_text(int(user.id), getattr(user, "username", None))
+    await _render_menu_surface(
+        target=target,
+        text=text,
+        reply_markup=_limits_kb(),
+        parse_mode="HTML",
+    )
+
+
 async def _send_or_edit_diagnostics(target: Message | CallbackQuery):
     user = target.from_user
     if not user:
@@ -948,6 +1035,21 @@ async def menu_refresh(callback: CallbackQuery, state: FSMContext):
         result="ok",
     )
     await _send_or_edit_menu(callback)
+
+
+
+@router.callback_query(F.data == CB_LIMITS)
+async def menu_limits(callback: CallbackQuery, state: FSMContext):
+    with contextlib.suppress(Exception):
+        await state.clear()
+    log_event(
+        logger,
+        "menu_limits_open",
+        user_id=callback.from_user.id,
+        callback_data=callback.data,
+        result="ok",
+    )
+    await _send_or_edit_limits(callback)
 
 
 @router.callback_query(F.data == CB_DIAG)
