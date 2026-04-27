@@ -855,7 +855,7 @@ async def _send_or_edit_responds_role(target: Message | CallbackQuery, side: str
         return
 
     with contextlib.suppress(Exception):
-        await _clear_menu_surface(int(user.id))
+        await _set_menu_surface(int(user.id), MENU_SURFACE_RESPONDS_ROOT)
 
     async with get_sessionmaker()() as session:
         repo = RespondRepo(session)
@@ -878,7 +878,7 @@ async def _send_or_edit_responds_bucket(target: Message | CallbackQuery, side: s
         return
 
     with contextlib.suppress(Exception):
-        await _clear_menu_surface(int(user.id))
+        await _set_menu_surface(int(user.id), MENU_SURFACE_RESPONDS_ROOT)
 
     offset = max(page, 0) * RESPONDS_PAGE_SIZE
 
@@ -1093,6 +1093,14 @@ async def menu_responds_bucket(callback: CallbackQuery, state: FSMContext):
         except Exception:
             pass
         return
+
+    with contextlib.suppress(Exception):
+        r = getattr(runtime, "REDIS", None)
+        if r is not None:
+            await r.delete(f"respond:active_view:{int(callback.from_user.id)}")
+
+    with contextlib.suppress(Exception):
+        await _set_menu_surface(int(callback.from_user.id), MENU_SURFACE_RESPONDS_ROOT)
 
     log_event(
         logger,
