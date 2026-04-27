@@ -694,6 +694,7 @@ def _responds_bucket_text(side: str, bucket: str, page: int, total: int, items: 
 MENU_SURFACE_KEY = "menu:surface:{user_id}"
 MENU_SURFACE_ROOT = "root"
 MENU_SURFACE_DIAG_PUBLICATION = "diag_publication"
+MENU_SURFACE_DIAG_PENDING_CARD = "diag_pending_card"
 MENU_SURFACE_RESPONDS_ROOT = "responds_root"
 
 
@@ -701,6 +702,7 @@ async def _set_menu_surface(user_id: int, surface: str) -> None:
     shadow_surface = {
         "root": "menu_root",
         "diag_publication": "menu_diag_publication",
+        "diag_pending_card": "menu_diag_pending_card",
         "alerts_root": "menu_alerts_root",
         "responds_root": "menu_responds_root",
     }.get(str(surface), str(surface))
@@ -818,7 +820,7 @@ async def _send_or_edit_pending_ad(target: Message | CallbackQuery, ad_id: int):
         return
 
     with contextlib.suppress(Exception):
-        await _clear_menu_surface(int(user.id))
+        await _set_menu_surface(int(user.id), MENU_SURFACE_DIAG_PENDING_CARD)
 
     diag = _diag_mod()
     ad = await diag.get_pending_ad_for_user(int(user.id), int(ad_id))
@@ -1000,6 +1002,8 @@ async def menu_diag_pending_open(callback: CallbackQuery, state: FSMContext):
 
     with contextlib.suppress(Exception):
         await state.clear()
+    with contextlib.suppress(Exception):
+        await _set_menu_surface(int(callback.from_user.id), MENU_SURFACE_DIAG_PENDING_CARD)
     log_event(
         logger,
         "menu_diag_pending_open",

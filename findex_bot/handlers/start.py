@@ -16,6 +16,7 @@ from aiogram.fsm.context import FSMContext
 from findex_bot.utils.hints_registry import (
     MENU_ALERTS_ROOT_TRASH,
     MENU_DIAG_PUBLICATION_TRASH,
+    MENU_DIAG_PENDING_CARD_TRASH,
     MENU_RESPONDS_ROOT_TRASH,
     MENU_ROOT_TRASH,
     RESPOND_ACTIVE_CARD_TRASH,
@@ -217,6 +218,9 @@ async def welcome_menu_clean_thread(message: Message, state: FSMContext):
         elif surface == "diag_publication":
             legacy_surface = "menu_diag_publication"
             hint_text = get_hint_text(MENU_DIAG_PUBLICATION_TRASH)
+        elif surface == "diag_pending_card":
+            legacy_surface = "menu_diag_pending_card"
+            hint_text = get_hint_text(MENU_DIAG_PENDING_CARD_TRASH)
         elif surface == "alerts_root":
             legacy_surface = "menu_alerts_root"
             hint_text = get_hint_text(MENU_ALERTS_ROOT_TRASH)

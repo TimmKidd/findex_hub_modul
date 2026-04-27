@@ -16,6 +16,7 @@ class HintSpec:
 WELCOME_ROLES_TRASH = "welcome_roles_trash"
 MENU_ROOT_TRASH = "menu_root_trash"
 MENU_DIAG_PUBLICATION_TRASH = "menu_diag_publication_trash"
+MENU_DIAG_PENDING_CARD_TRASH = "menu_diag_pending_card_trash"
 MENU_ALERTS_ROOT_TRASH = "menu_alerts_root_trash"
 MENU_RESPONDS_ROOT_TRASH = "menu_responds_root_trash"
 VACANCY_CONTACT_MODE_TRASH = "vacancy_contact_mode_trash"
@@ -50,6 +51,13 @@ HINTS: Final[dict[str, HintSpec]] = {
         point=MENU_DIAG_PUBLICATION_TRASH,
         canonical_text="Используй кнопки выше: здесь ты можешь проверить статус публикации и открыть объявления на модерации.",
         ux_condition="мусор под блоком «Диагностика публикации»",
+        ux_points=1,
+        status="live",
+    ),
+    MENU_DIAG_PENDING_CARD_TRASH: HintSpec(
+        point=MENU_DIAG_PENDING_CARD_TRASH,
+        canonical_text="Используй кнопки выше: вернись в диагностику или в меню.",
+        ux_condition="мусор под открытой карточкой объявления из диагностики",
         ux_points=1,
         status="live",
     ),
