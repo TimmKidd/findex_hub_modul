@@ -44,3 +44,7 @@ deploy/audit_snapshots/*.sql
 
 # Support bot local secrets
 support_bot/.env
+
+# Runtime logs and pid files
+*.log
+*.pid
