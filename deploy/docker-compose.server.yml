@@ -33,6 +33,7 @@ services:
       - redis
 
   jobs:
+    restart: unless-stopped
     build:
       context: /Users/tmkd/Desktop/tmkd/FindexHub
       dockerfile: Dockerfile
@@ -44,6 +45,7 @@ services:
       - redis
 
   resurrection:
+    restart: unless-stopped
     build:
       context: /Users/tmkd/Desktop/tmkd/FindexHub
       dockerfile: Dockerfile
@@ -55,6 +57,7 @@ services:
       - redis
 
   support:
+    restart: unless-stopped
     build:
       context: /Users/tmkd/Desktop/tmkd/FindexHub
       dockerfile: Dockerfile
