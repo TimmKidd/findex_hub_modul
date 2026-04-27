@@ -52,3 +52,6 @@ support_bot/.env
 # local env secrets
 deploy/*.env
 !deploy/*.env.example
+
+# Local DB backups
+deploy/backups/*.sql.gz
