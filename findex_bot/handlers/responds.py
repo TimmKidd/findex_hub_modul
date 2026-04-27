@@ -981,6 +981,18 @@ async def _send_ephemeral_notice(bot, chat_id: int, text: str, *, seconds: int =
         await bot.delete_message(chat_id=int(chat_id), message_id=int(m.message_id))
 
 
+def _schedule_daily_limit_notice(bot, user_id: int, count: int) -> None:
+    left = max(int(RESPOND_DAILY_LIMIT) - int(count or 0), 0)
+    asyncio.create_task(
+        _send_ephemeral_notice(
+            bot,
+            int(user_id),
+            f"📩 Отклик отправлен.\nСегодня осталось: {left} из {RESPOND_DAILY_LIMIT}.",
+            seconds=5,
+        )
+    )
+
+
 async def _safe_delete_user_message(message: Message | None) -> None:
     if message is None:
         return
@@ -3199,6 +3211,8 @@ async def fast_respond_send(cb: CallbackQuery, state: FSMContext, redis: Any = N
         with contextlib.suppress(Exception):
             await state.clear()
 
+        _schedule_daily_limit_notice(cb.bot, int(cb.from_user.id), int(_count))
+
         return await safe_answer(
             cb,
             "🚀 Быстрый отклик отправлен\nРаботодатель уже может ответить",
@@ -4100,6 +4114,8 @@ async def form_send(cb: CallbackQuery, state: FSMContext, redis: Any = None):
             )
         with contextlib.suppress(Exception):
             await state.clear()
+
+        _schedule_daily_limit_notice(cb.bot, int(cb.from_user.id), int(_count))
 
         return await safe_answer(
             cb,
