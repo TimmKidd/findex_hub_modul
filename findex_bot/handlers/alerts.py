@@ -367,10 +367,7 @@ def _welcome_text() -> str:
     return (
         "🔔 <b>Уведомления / Алерты</b>\n\n"
         "Фильтры: тип + должность + локация.\n"
-        "Для Москвы можно указать метро (пример: Москва, Тверская).\n\n"
-        "ℹ️ Доступ зависит от типа объявления:\n"
-        "• Соискатель → 1 уведомление на 30 дней\n"
-        "• Работодатель → 2 уведомления на 30 дней"
+        "Для Москвы можно указать метро (пример: Москва, Тверская)."
     )
 
 
@@ -392,17 +389,29 @@ def _is_list_message(text: str | None) -> bool:
 def _alerts_limits_diag_text(user_id: int, items: list[dict]) -> str:
     u = _u()
 
-    seeker_active = len(u.active_alerts_for_role(items, u.ROLE_SEEKER))
-    employer_active = len(u.active_alerts_for_role(items, u.ROLE_EMPLOYER))
-
     seeker_limit = u.get_max_alerts(user_id, u.ROLE_SEEKER)
     employer_limit = u.get_max_alerts(user_id, u.ROLE_EMPLOYER)
 
+    seeker_available = u.available_alerts_for_role(user_id, u.ROLE_SEEKER, items)
+    employer_available = u.available_alerts_for_role(user_id, u.ROLE_EMPLOYER, items)
+
+    log_event(
+        logger,
+        "alert_limits_render",
+        user_id=user_id,
+        items_count=len(items or []),
+        seeker_available=seeker_available,
+        seeker_limit=seeker_limit,
+        employer_available=employer_available,
+        employer_limit=employer_limit,
+        result="ok",
+    )
+
     return (
         "🧾 <b>Лимиты уведомлений</b>\n\n"
-        f"👤 Соискатель: {seeker_active}/{seeker_limit}\n"
-        f"💼 Работодатель: {employer_active}/{employer_limit}\n\n"
-        "ℹ️ Уведомления действуют 30 дней."
+        "В этом месяце доступно:\n\n"
+        f"👤 Соискатель: {seeker_available}/{seeker_limit}\n"
+        f"💼 Работодатель: {employer_available}/{employer_limit}"
     )
 
 
@@ -421,10 +430,20 @@ def _render_alerts_list_text(items: list[dict]) -> str:
 
 def _render_alerts_list_kb(items: list[dict]) -> InlineKeyboardMarkup:
     rows: list[list[InlineKeyboardButton]] = []
+    u = _u()
 
     for i, a in enumerate(items, 1):
         aid = str(a.get("id") or "")
         enabled = bool(a.get("enabled", True))
+        is_consumed = bool(a.get("consumed") or False)
+
+        if is_consumed:
+            rows.append(
+                [
+                    InlineKeyboardButton(text=f"🔥 Сгорел #{i}", callback_data="al_noop"),
+                ]
+            )
+            continue
 
         toggle_text = ("🔕 Выкл" if enabled else "🔔 Вкл") + f" #{i}"
         del_text = "🗑 Удалить" + f" #{i}"
@@ -453,6 +472,15 @@ def _render_frozen_list_kb(items: list[dict], subscribe_url: str) -> InlineKeybo
     for i, a in enumerate(items, 1):
         aid = str(a.get("id") or "")
         enabled = bool(a.get("enabled", True))
+        is_consumed = bool(a.get("consumed") or False)
+
+        if is_consumed:
+            rows.append(
+                [
+                    InlineKeyboardButton(text=f"🔥 Сгорел #{i}", callback_data="al_noop"),
+                ]
+            )
+            continue
 
         toggle_text = f"🔕 Выкл #{i}" if enabled else f"🔒 Вкл #{i}"
         del_text = f"🗑 Удалить #{i}"
@@ -981,6 +1009,11 @@ async def alerts_metro_station_pick(cb: CallbackQuery, state: FSMContext):
     await _finish_alert_create(cb.message, state, owner_user_id=int(cb.from_user.id), location_value=location_value)
 
 
+@router.callback_query(F.data == "al_noop")
+async def alerts_noop(cb: CallbackQuery):
+    await _safe_answer(cb, "🔥 Этот алерт уже сгорел в этом месяце", alert=True)
+
+
 @router.callback_query(F.data == CB_LIST)
 async def alerts_list(cb: CallbackQuery):
     await _safe_answer(cb)
@@ -1020,6 +1053,19 @@ async def alerts_toggle(cb: CallbackQuery):
             result="not_found",
         )
         await _safe_answer(cb, "⚠️ Алерт не найден", alert=True)
+        return
+
+    if bool(current.get("consumed") or False):
+        log_event(
+            logger,
+            "alert_toggle",
+            user_id=user_id,
+            alert_id=alert_id,
+            callback_data=cb.data,
+            result="consumed_blocked",
+        )
+        await _safe_answer(cb, "🔥 Этот алерт уже сгорел в этом месяце", alert=True)
+        await _show_alerts_list(cb, user_id)
         return
 
     access = await _alerts_access_state(cb.bot, user_id)
@@ -1084,6 +1130,38 @@ async def alerts_delete(cb: CallbackQuery):
 
     user_id = int(cb.from_user.id)
     alert_id = (cb.data or "").split(":", 1)[-1].strip()
+
+    alerts = await u.get_user_alerts(user_id)
+    current = None
+    for a in alerts:
+        if str(a.get("id") or "") == alert_id:
+            current = a
+            break
+
+    if current is None:
+        log_event(
+            logger,
+            "alert_delete",
+            user_id=user_id,
+            alert_id=alert_id,
+            callback_data=cb.data,
+            result="not_found",
+        )
+        await _safe_answer(cb, "⚠️ Не найдено", alert=True)
+        return
+
+    if bool(current.get("consumed") or False):
+        log_event(
+            logger,
+            "alert_delete",
+            user_id=user_id,
+            alert_id=alert_id,
+            callback_data=cb.data,
+            result="consumed_blocked",
+        )
+        await _safe_answer(cb, "🔥 Этот алерт уже сгорел в этом месяце", alert=True)
+        await _show_alerts_list(cb, user_id)
+        return
 
     access = await _alerts_access_state(cb.bot, user_id)
     if access["is_blocked"]:

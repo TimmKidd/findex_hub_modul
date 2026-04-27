@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import time
+from datetime import datetime
 import uuid
 import logging
 import re
@@ -46,13 +47,13 @@ PLAN_SPECS = {
     PLAN_FREE: {
         ROLE_SEEKER: {
             "max_alerts": 1,
-            "ttl_days": 30,
+            "ttl_days": 0,
             "advanced_filters": False,
             "delivery_priority": "normal",
         },
         ROLE_EMPLOYER: {
-            "max_alerts": 2,
-            "ttl_days": 30,
+            "max_alerts": 1,
+            "ttl_days": 0,
             "advanced_filters": False,
             "delivery_priority": "normal",
         },
@@ -127,6 +128,47 @@ def get_ttl_days(user_id: int, target_role: str) -> int:
     return int(spec.get("ttl_days", 30))
 
 
+def current_month_key(ts: int | None = None) -> str:
+    dt = datetime.fromtimestamp(int(ts or time.time()))
+    return dt.strftime("%Y-%m")
+
+
+def _alert_month_key(a: dict, now_ts: int | None = None) -> str:
+    mk = str(a.get("month_key") or "").strip()
+    if mk:
+        return mk
+    created_at = int(a.get("created_at") or now_ts or time.time())
+    return current_month_key(created_at)
+
+
+def _is_alert_consumed(a: dict, now_ts: int | None = None) -> bool:
+    return bool(a.get("consumed") or False)
+
+
+def monthly_alerts_for_role(alerts: list[dict], target_role: str, now_ts: int | None = None) -> list[dict]:
+    now_ts = int(now_ts or time.time())
+    month_key = current_month_key(now_ts)
+    out: list[dict] = []
+
+    for a in alerts or []:
+        if not isinstance(a, dict):
+            continue
+        a = _ensure_alert_shape(a)
+        if a.get("target_role") != target_role:
+            continue
+        if _alert_month_key(a, now_ts) != month_key:
+            continue
+        out.append(a)
+
+    return out
+
+
+def available_alerts_for_role(user_id: int, target_role: str, alerts: list[dict]) -> int:
+    limit = get_max_alerts(user_id, target_role)
+    used = len(monthly_alerts_for_role(alerts, target_role))
+    return max(0, int(limit) - int(used))
+
+
 def active_alerts_for_role(alerts: list[dict], target_role: str) -> list[dict]:
     now_ts = int(time.time())
     out: list[dict] = []
@@ -134,6 +176,10 @@ def active_alerts_for_role(alerts: list[dict], target_role: str) -> list[dict]:
         if not isinstance(a, dict):
             continue
         if a.get("target_role") != target_role:
+            continue
+        if _alert_month_key(a, now_ts) != current_month_key(now_ts):
+            continue
+        if _is_alert_consumed(a, now_ts):
             continue
         if _is_alert_expired(a, now_ts):
             continue
@@ -145,22 +191,19 @@ def active_alerts_for_role(alerts: list[dict], target_role: str) -> list[dict]:
 
 def can_create_alert(user_id: int, target_role: str, alerts: list[dict]) -> bool:
     limit = get_max_alerts(user_id, target_role)
-    active = active_alerts_for_role(alerts, target_role)
-    return len(active) < limit
+    used_this_month = monthly_alerts_for_role(alerts, target_role)
+    return len(used_this_month) < limit
 
 
 def limits_text(target_role: str, user_id: int | None = None) -> str:
     uid = int(user_id or 0)
-    limit = get_max_alerts(uid, target_role) if uid else (
-        1 if target_role == ROLE_SEEKER else 2
-    )
-    ttl_days = get_ttl_days(uid, target_role) if uid else 30
+    limit = get_max_alerts(uid, target_role) if uid else 1
 
     if target_role == ROLE_SEEKER:
-        return f"👤 Лимит: {limit} уведомление на {ttl_days} дней"
+        return f"👤 Лимит: {limit} уведомление в месяц. После срабатывания алерт сгорает."
     if target_role == ROLE_EMPLOYER:
-        return f"💼 Лимит: {limit} уведомления на {ttl_days} дней"
-    return f"🔔 Лимит: {limit} уведомлений на {ttl_days} дней"
+        return f"💼 Лимит: {limit} уведомление в месяц. После срабатывания алерт сгорает."
+    return f"🔔 Лимит: {limit} уведомление в месяц. После срабатывания алерт сгорает."
 
 
 # ----------------------------
@@ -245,13 +288,17 @@ def _is_alert_expired(a: dict, now_ts: int | None = None) -> bool:
     if created_at <= 0:
         return False
 
-    return now_ts >= (created_at + ALERT_TTL_SECONDS)
+    return False
 
 
 def _alert_matches(ad_role: str, ad_position: str, ad_location: str, alert: dict) -> bool:
     if (alert.get("target_role") or "") != ad_role:
         return False
     if not alert.get("enabled", True):
+        return False
+    if _is_alert_consumed(alert):
+        return False
+    if _alert_month_key(alert) != current_month_key():
         return False
     if _is_alert_expired(alert):
         return False
@@ -283,6 +330,9 @@ class Alert:
     location_keywords: list[str]
     created_at: int
     expires_at: int
+    month_key: str = ""
+    consumed: bool = False
+    consumed_at: int = 0
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -293,6 +343,9 @@ class Alert:
             "location_keywords": list(self.location_keywords or []),
             "created_at": int(self.created_at),
             "expires_at": int(self.expires_at),
+            "month_key": str(self.month_key or current_month_key(self.created_at)),
+            "consumed": bool(self.consumed),
+            "consumed_at": int(self.consumed_at or 0),
         }
 
 
@@ -322,8 +375,14 @@ def _ensure_alert_shape(a: dict) -> dict:
     a["created_at"] = created_at
 
     target_role = str(a.get("target_role") or "")
-    ttl_days = get_ttl_days(0, target_role) if target_role else 30
-    a.setdefault("expires_at", int(created_at + ttl_days * 24 * 3600))
+    ttl_days = get_ttl_days(0, target_role) if target_role else 0
+    a.setdefault("month_key", current_month_key(created_at))
+    a.setdefault("consumed", False)
+    a.setdefault("consumed_at", 0)
+    if ttl_days > 0:
+        a.setdefault("expires_at", int(created_at + ttl_days * 24 * 3600))
+    else:
+        a.setdefault("expires_at", 0)
     return a
 
 
@@ -354,6 +413,9 @@ async def get_user_alerts(user_id: int) -> list[dict]:
             a = _ensure_alert_shape(a)
 
             a = _normalize_single_position_keyword(a)
+            if _alert_month_key(a, now_ts) != current_month_key(now_ts):
+                changed = True
+                continue
             if _is_alert_expired(a, now_ts):
                 changed = True
                 continue
@@ -381,6 +443,9 @@ async def get_user_alerts(user_id: int) -> list[dict]:
         a = _ensure_alert_shape(a)
 
         a = _normalize_single_position_keyword(a)
+        if _alert_month_key(a, now_ts) != current_month_key(now_ts):
+            changed = True
+            continue
         if _is_alert_expired(a, now_ts):
             changed = True
             continue
@@ -402,6 +467,8 @@ async def set_user_alerts(user_id: int, alerts: list[dict]) -> None:
             a = _ensure_alert_shape(a)
 
             a = _normalize_single_position_keyword(a)
+            if _alert_month_key(a, now_ts) != current_month_key(now_ts):
+                continue
             if _is_alert_expired(a, now_ts):
                 continue
             clean.append(a)
@@ -415,6 +482,28 @@ async def set_user_alerts(user_id: int, alerts: list[dict]) -> None:
 
     key = KEY_ALERTS_USER.format(user_id=int(user_id))
     await r.set(key, json.dumps(clean, ensure_ascii=False))
+
+
+async def consume_alert(user_id: int, alert_id: str) -> bool:
+    alerts = await get_user_alerts(user_id)
+    now_ts = int(time.time())
+    changed = False
+
+    for a in alerts:
+        if str(a.get("id") or "") != str(alert_id):
+            continue
+        a["consumed"] = True
+        a["consumed_at"] = now_ts
+        a["enabled"] = False
+        changed = True
+        break
+
+    if not changed:
+        return False
+
+    await set_user_alerts(user_id, alerts)
+    await _rebuild_user_target_index(user_id, alerts)
+    return True
 
 
 async def _rebuild_user_target_index(user_id: int, alerts: list[dict]) -> None:
@@ -454,8 +543,6 @@ async def add_alert(user_id: int, target_role: str, position_raw: str, location_
         raise RuntimeError(LIMIT_REACHED_TEXT)
 
     now_ts = int(time.time())
-    ttl_days = get_ttl_days(user_id, target_role)
-
     a = Alert(
         id=uuid.uuid4().hex[:10],
         enabled=True,
@@ -463,7 +550,10 @@ async def add_alert(user_id: int, target_role: str, position_raw: str, location_
         position_keywords=pos,
         location_keywords=loc,
         created_at=now_ts,
-        expires_at=now_ts + ttl_days * 24 * 3600,
+        expires_at=0,
+        month_key=current_month_key(now_ts),
+        consumed=False,
+        consumed_at=0,
     )
 
     alerts.append(a.to_dict())
@@ -825,8 +915,9 @@ async def notify_on_published(
                         disable_web_page_preview=True,
                     )
                     sent_count += 1
+                    await consume_alert(uid, alert_id)
                     logger.info(
-                        "alerts: sent user=%s alert_id=%s ad_id=%s",
+                        "alerts: sent user=%s alert_id=%s ad_id=%s consumed=1",
                         uid,
                         alert_id,
                         ad_id,
