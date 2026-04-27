@@ -48,3 +48,7 @@ support_bot/.env
 # Runtime logs and pid files
 *.log
 *.pid
+
+# local env secrets
+deploy/*.env
+!deploy/*.env.example
