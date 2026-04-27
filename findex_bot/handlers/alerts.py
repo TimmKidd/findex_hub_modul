@@ -4,6 +4,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
+import time
 from typing import Any
 
 from aiogram import Router, F
@@ -665,6 +666,7 @@ async def alerts_new(cb: CallbackQuery, state: FSMContext):
 
     await state.clear()
     await state.set_state(AlertFSM.target_role)
+    await state.update_data(clean_thread_hint_key="menu_alerts_root")
     await _cleanup_reset(state)
 
     text = (
@@ -687,6 +689,25 @@ async def alerts_new(cb: CallbackQuery, state: FSMContext):
             reply_markup=u.choose_target_keyboard(),
         )
         await _cleanup_track_bot_message(state, msg)
+
+
+@router.message(AlertFSM.target_role, F.text & ~F.text.startswith("/"))
+async def alerts_target_role_trash(message: Message, state: FSMContext):
+    with contextlib.suppress(Exception):
+        await message.delete()
+
+    data = await state.get_data()
+    now_ts = int(time.time())
+    last_hint_ts = int(data.get("clean_thread_hint_ts") or 0)
+
+    if (now_ts - last_hint_ts) < 3:
+        return
+
+    from findex_bot.utils.hints_registry import MENU_ALERTS_ROOT_TRASH, get_hint_text
+
+    await state.update_data(clean_thread_hint_ts=now_ts)
+    with contextlib.suppress(Exception):
+        await _temp_message(message, get_hint_text(MENU_ALERTS_ROOT_TRASH), seconds=3)
 
 
 @router.callback_query(F.data.startswith("al_target:"))
