@@ -28,12 +28,12 @@ logging.basicConfig(level=logging.INFO)
 load_dotenv(dotenv_path=os.path.join(os.path.dirname(__file__), ".env"))
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-SUPPORT_GROUP_ID_RAW = os.getenv("SUPPORT_GROUP_ID")
+SUPPORT_GROUP_ID_RAW = os.getenv("SUPPORT_CHAT_ID")
 
 if not BOT_TOKEN:
     raise RuntimeError("❌ BOT_TOKEN не задан в .env (support_bot)")
 if not SUPPORT_GROUP_ID_RAW:
-    raise RuntimeError("❌ SUPPORT_GROUP_ID не задан в .env (support_bot)")
+    raise RuntimeError("❌ SUPPORT_CHAT_ID не задан в .env (support_bot)")
 
 SUPPORT_GROUP_ID = int(SUPPORT_GROUP_ID_RAW)
 
