@@ -395,18 +395,6 @@ def _alerts_limits_diag_text(user_id: int, items: list[dict]) -> str:
     seeker_available = u.available_alerts_for_role(user_id, u.ROLE_SEEKER, items)
     employer_available = u.available_alerts_for_role(user_id, u.ROLE_EMPLOYER, items)
 
-    log_event(
-        logger,
-        "alert_limits_render",
-        user_id=user_id,
-        items_count=len(items or []),
-        seeker_available=seeker_available,
-        seeker_limit=seeker_limit,
-        employer_available=employer_available,
-        employer_limit=employer_limit,
-        result="ok",
-    )
-
     return (
         "🧾 <b>Лимиты уведомлений</b>\n\n"
         "В этом месяце доступно:\n\n"
