@@ -31,7 +31,7 @@ RES_LEADER_KEY = os.getenv("RES_WORKER_LEADER_KEY", "resurrection:leader:findexh
 BOT_POLLING_LOCK_KEY = "findexhub:polling_lock"
 
 AD_TTL_DAYS = int(os.getenv("AD_TTL_DAYS", "30"))
-RESPOND_TTL_DAYS = int(os.getenv("RESPOND_TTL_DAYS", "21"))
+RESPOND_TTL_DAYS = int(os.getenv("RESPOND_TTL_DAYS", "30"))
 
 RES_STAGE_30M_SEC = 30 * 60
 RES_STAGE_4H_SEC = 4 * 60 * 60

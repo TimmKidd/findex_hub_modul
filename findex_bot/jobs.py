@@ -40,7 +40,7 @@ TICK_SEC = int(os.getenv("JOBS_TICK_SEC", "10"))
 BATCH_SIZE = int(os.getenv("JOBS_BATCH_SIZE", "200"))
 
 # TTL
-RESPOND_TTL_DAYS = int(os.getenv("RESPOND_TTL_DAYS", "21"))
+RESPOND_TTL_DAYS = int(os.getenv("RESPOND_TTL_DAYS", "30"))
 AD_TTL_DAYS = int(os.getenv("AD_TTL_DAYS", "30"))
 
 # Resurrection stages

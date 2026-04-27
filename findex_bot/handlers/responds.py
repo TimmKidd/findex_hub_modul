@@ -55,9 +55,9 @@ router = Router()
 # ---------------------------
 # Константы
 # ---------------------------
-RESPOND_TTL_DAYS = 21
-RESPOND_DAILY_LIMIT = 5
-PENDING_RESPOND_TTL_MIN = 15
+RESPOND_TTL_DAYS = 30
+RESPOND_DAILY_LIMIT = 12
+PENDING_RESPOND_TTL_MIN = 30
 AD_TTL_DAYS = int(os.getenv("AD_TTL_DAYS", "30"))
 
 RESPOND_DAILY_TZ = os.getenv("RESPOND_DAILY_TZ", "Europe/Moscow")
@@ -81,7 +81,7 @@ from findex_bot.utils.hints_registry import (
     get_hint_text,
 )
 ACTIVE_TTL_SEC = RESPOND_TTL_DAYS * 24 * 60 * 60
-ACTIVE_VIEW_TTL_SEC = 60 * 60
+ACTIVE_VIEW_TTL_SEC = 6 * 60 * 60
 
 REJECT_NOTICE_DELETE_SEC = 6
 
@@ -805,11 +805,11 @@ async def _acquire_submit_lock(redis: Any, user_id: int, ad_id: int) -> tuple[bo
     r = _get_redis(redis)
     key = SUBMIT_LOCK_KEY.format(user_id=int(user_id), ad_id=int(ad_id))
     token = uuid.uuid4().hex
-    ok = await r.set(key, token, ex=20, nx=True)
+    ok = await r.set(key, token, ex=8, nx=True)
     return bool(ok), token
 
 
-async def _acquire_click_lock(redis: Any, user_id: int, ad_id: int, ttl_ms: int = 700) -> bool:
+async def _acquire_click_lock(redis: Any, user_id: int, ad_id: int, ttl_ms: int = 900) -> bool:
     """
     Анти-спам/анти-гонка на входе.
     """
@@ -826,7 +826,7 @@ async def _acquire_click_lock(redis: Any, user_id: int, ad_id: int, ttl_ms: int 
         return True
 
 
-async def _acquire_form_send_click_lock(redis: Any, user_id: int, ad_id: int, ttl_ms: int = 1800) -> bool:
+async def _acquire_form_send_click_lock(redis: Any, user_id: int, ad_id: int, ttl_ms: int = 2500) -> bool:
     """
     Короткий anti-race lock именно на кнопку отправки анкеты.
     Нужен, чтобы не пускать повторные callback'и form_send почти одновременно.
