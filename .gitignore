@@ -41,3 +41,6 @@ deploy/main.env
 # sql dumps / manual audit snapshots
 *.sql
 deploy/audit_snapshots/*.sql
+
+# Support bot local secrets
+support_bot/.env
