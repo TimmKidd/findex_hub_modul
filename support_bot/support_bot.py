@@ -26,6 +26,7 @@ from aiogram.client.default import DefaultBotProperties
 from aiogram.client.session.aiohttp import AiohttpSession
 from aiogram.filters import Command, StateFilter
 
+
 logging.basicConfig(level=logging.INFO)
 
 # .env рядом с этим файлом (support_bot/.env)
@@ -41,6 +42,7 @@ if not SUPPORT_GROUP_ID_RAW:
 
 SUPPORT_GROUP_ID = int(SUPPORT_GROUP_ID_RAW)
 SUPPORT_DB_DSN = os.getenv("SUPPORT_DB_DSN")
+MAIN_CHANNEL_ID = int(os.getenv("MAIN_CHANNEL_ID", "0") or 0)
 
 # ✅ важно: timeout числом, parse_mode через DefaultBotProperties
 session = AiohttpSession(timeout=30)
@@ -80,6 +82,7 @@ SOON_CALLBACKS = {"search_filters_problem", "profile_question_soon"}
 # callback_data для меню
 CB_MENU_START = "sb_menu_start"
 CB_BACK_MENU = "support:back_menu"
+CB_CHECK_SUB = "support:check_sub"
 
 
 async def _track_cleanup_message(user_id: int, message: Message | None) -> None:
@@ -128,6 +131,88 @@ def _support_trash_hint(user_id: int) -> str:
         return "Используй кнопки выше или перейди в /menu."
 
     return "Используй кнопки выше: создай обращение, посмотри свои обращения или открой нужный раздел."
+
+
+def _channel_url() -> str:
+    channel_username = (os.getenv("CHANNEL_USERNAME") or "").strip().lstrip("@")
+    return f"https://t.me/{channel_username}" if channel_username else "https://t.me"
+
+
+def get_subscription_gate_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="📣 Подписаться на канал", url=_channel_url())],
+            [InlineKeyboardButton(text="🔄 Проверить подписку", callback_data=CB_CHECK_SUB)],
+        ]
+    )
+
+
+def subscription_gate_text() -> str:
+    return (
+        "⛔ <b>Доступ к поддержке ограничен</b>\n\n"
+        "Чтобы пользоваться FindexHub Support, подпишись на канал объявлений.\n\n"
+        "После подписки нажми «🔄 Проверить подписку»."
+    )
+
+
+async def _support_access_ok(user_id: int) -> bool:
+    if not MAIN_CHANNEL_ID:
+        logging.warning("support gate: MAIN_CHANNEL_ID is not configured")
+        return True
+
+    try:
+        member = await bot.get_chat_member(chat_id=MAIN_CHANNEL_ID, user_id=int(user_id))
+        return str(member.status) in {"creator", "administrator", "member"}
+    except Exception:
+        logging.exception("support gate: subscription check failed user_id=%s", user_id)
+        return False
+
+
+async def _block_support_message(message: Message, state: FSMContext) -> bool:
+    user = message.from_user
+    if not user:
+        return False
+
+    ok = await _support_access_ok(int(user.id))
+    if ok:
+        return False
+
+    await state.clear()
+    support_surface[int(user.id)] = "menu"
+
+    with contextlib.suppress(Exception):
+        await message.delete()
+
+    await _cleanup_user_messages(message.chat.id, user.id)
+
+    await message.answer(
+        subscription_gate_text(),
+        reply_markup=get_subscription_gate_keyboard(),
+    )
+    return True
+
+
+async def _block_support_callback(callback: CallbackQuery, state: FSMContext) -> bool:
+    ok = await _support_access_ok(int(callback.from_user.id))
+    if ok:
+        return False
+
+    await state.clear()
+    support_surface[int(callback.from_user.id)] = "menu"
+
+    if callback.message:
+        await _cleanup_user_messages(
+            callback.message.chat.id,
+            callback.from_user.id,
+            exclude_ids={int(callback.message.message_id)},
+        )
+        await callback.message.edit_text(
+            subscription_gate_text(),
+            reply_markup=get_subscription_gate_keyboard(),
+        )
+
+    await callback.answer("Подпишись на канал и нажми «Проверить подписку».", show_alert=True)
+    return True
 
 
 def get_main_inline_keyboard() -> InlineKeyboardMarkup:
@@ -329,6 +414,9 @@ dp.startup.register(on_startup)
 # -------------------------
 @dp.message(Command("start"))
 async def cmd_start(message: Message, state: FSMContext):
+    if await _block_support_message(message, state):
+        return
+
     with contextlib.suppress(Exception):
         await message.delete()
     await show_start(message, state)
@@ -339,6 +427,9 @@ async def cmd_start(message: Message, state: FSMContext):
 # -------------------------
 @dp.message(Command("menu"))
 async def cmd_menu(message: Message, state: FSMContext):
+    if await _block_support_message(message, state):
+        return
+
     await state.clear()
     if message.from_user:
         support_surface[int(message.from_user.id)] = "menu"
@@ -415,8 +506,40 @@ def get_ticket_detail_keyboard(page: int) -> InlineKeyboardMarkup:
     )
 
 
+@dp.callback_query(F.data == CB_CHECK_SUB)
+async def cb_check_subscription(callback: CallbackQuery, state: FSMContext):
+    ok = await _support_access_ok(int(callback.from_user.id))
+
+    if not ok:
+        if callback.message:
+            await callback.message.edit_text(
+                subscription_gate_text(),
+                reply_markup=get_subscription_gate_keyboard(),
+            )
+        await callback.answer("Подписка пока не найдена.", show_alert=True)
+        return
+
+    await state.clear()
+    support_surface[int(callback.from_user.id)] = "menu"
+
+    if callback.message:
+        await callback.message.edit_text(
+            "👋 <b>FindexHub Support</b>\n\n"
+            "Это официальный саппорт FindexHub.\n"
+            "Все обращения обрабатываются через форму.\n"
+            "Менеджер свяжется с тобой при необходимости.\n\n"
+            "Выбери действие:",
+            reply_markup=get_menu_keyboard(),
+        )
+
+    await callback.answer("Доступ открыт ✅")
+
+
 @dp.callback_query(F.data.regexp(r"^support:ticket:\d+:\d+$"))
 async def cb_ticket_detail(callback: CallbackQuery, state: FSMContext):
+    if await _block_support_callback(callback, state):
+        return
+
     await callback.answer()
     support_surface[int(callback.from_user.id)] = "my_tickets"
 
@@ -441,6 +564,9 @@ async def cb_ticket_detail(callback: CallbackQuery, state: FSMContext):
 
 @dp.callback_query(F.data.regexp(r"^support:my_tickets(?::\d+)?$"))
 async def cb_my_tickets(callback: CallbackQuery, state: FSMContext):
+    if await _block_support_callback(callback, state):
+        return
+
     await callback.answer()
     support_surface[int(callback.from_user.id)] = "my_tickets"
 
@@ -488,6 +614,9 @@ async def cb_back_menu(callback: CallbackQuery, state: FSMContext):
 
 @dp.callback_query(F.data == CB_MENU_START)
 async def cb_menu_start(callback: CallbackQuery, state: FSMContext):
+    if await _block_support_callback(callback, state):
+        return
+
     await state.clear()
     support_surface[int(callback.from_user.id)] = "categories"
 
@@ -532,6 +661,9 @@ async def soon_callback(callback: types.CallbackQuery, state: FSMContext):
 
 @dp.callback_query(F.data == "suggest_feature")
 async def feature_start(callback: types.CallbackQuery, state: FSMContext):
+    if await _block_support_callback(callback, state):
+        return
+
     await callback.message.edit_text(
         "Пожалуйста, опишите ваше предложение по 4 пунктам:\n"
         "1) Что добавить?\n"
@@ -548,6 +680,9 @@ async def feature_start(callback: types.CallbackQuery, state: FSMContext):
 
 @dp.message(SupportStates.suggest_feature)
 async def handle_suggest_feature(message: Message, state: FSMContext):
+    if await _block_support_message(message, state):
+        return
+
     user = message.from_user
     if not user:
         return
@@ -598,6 +733,9 @@ async def handle_suggest_feature(message: Message, state: FSMContext):
     )
 )
 async def ask_for_problem_details(callback: types.CallbackQuery, state: FSMContext):
+    if await _block_support_callback(callback, state):
+        return
+
     selected_text = next((text for text, cb in BUTTONS if cb == callback.data), "Без темы")
 
     await state.set_state(SupportStates.waiting_text)
@@ -614,6 +752,9 @@ async def ask_for_problem_details(callback: types.CallbackQuery, state: FSMConte
 
 @dp.message(SupportStates.waiting_text)
 async def handle_problem_details(message: Message, state: FSMContext):
+    if await _block_support_message(message, state):
+        return
+
     user = message.from_user
     if not user:
         return
