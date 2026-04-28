@@ -159,49 +159,17 @@ def _h(value: Any) -> str:
 
 
 def build_share_card(ad_or_payload: Any, bot_username: str) -> str:
-    payload = _p(ad_or_payload)
-    role = resolve_ad_role(ad_or_payload)
+    ad_text = get_ad_text(ad_or_payload, include_contacts=True)
 
+    payload = _p(ad_or_payload)
     ad_id = int(getattr(ad_or_payload, "id", 0) or payload.get("id") or 0)
     username = str(bot_username or "").strip().lstrip("@")
 
-    title = _display_or_fallback(payload.get("title"), "Не указано")
-    salary = _display_or_fallback(payload.get("salary"), "По договорённости")
-    location = _display_or_fallback(payload.get("location"), "Не указано")
-    schedule = _display_or_fallback(payload.get("schedule"), "Не указан")
-
     deep_link = f"https://t.me/{username}?start=resp_{ad_id}" if username and ad_id else "https://t.me"
+
     cta_line = f'<a href="{html.escape(deep_link, quote=True)}">📩 Откликнуться за 30 секунд</a>'
 
-    channel_url = _share_channel_url()
-    if channel_url:
-        footer = (
-            "—\n"
-            f'🚀 <a href="{html.escape(channel_url, quote=True)}">FindexHub</a>\n'
-            "быстрые вакансии в Telegram"
-        )
-    else:
-        footer = "—\n🚀 FindexHub\nбыстрые вакансии в Telegram"
-
-    if role == "seeker":
-        return (
-            f"👤 {_h(title)}\n\n"
-            f"📍 {_h(location)}\n"
-            f"💰 {_h(salary)}\n"
-            f"🕒 {_h(schedule)}\n\n"
-            f"{cta_line}\n\n"
-            "👉 Перешли тому, кому может подойти это объявление\n\n"
-            f"{footer}"
-        )
-
-    return (
-        f"🔥 {_h(title)}\n\n"
-        f"📍 {_h(location)}\n"
-        f"💰 {_h(salary)}\n\n"
-        f"{cta_line}\n\n"
-        "👉 Перешли тому, кому может подойти эта вакансия\n\n"
-        f"{footer}"
-    )
+    return f"{html.escape(ad_text)}\n\n{cta_line}"
 
 
 def contains_bad_words(text: str) -> bool:
