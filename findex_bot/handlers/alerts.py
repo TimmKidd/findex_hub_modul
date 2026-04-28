@@ -526,7 +526,7 @@ async def _show_alerts_home(cb: CallbackQuery) -> None:
 async def _show_alerts_list(cb: CallbackQuery, user_id: int) -> None:
     with contextlib.suppress(Exception):
         menu_mod = _menu_mod()
-        await menu_mod._clear_menu_surface(int(user_id))
+        await menu_mod._set_menu_surface(int(user_id), "alerts_root")
 
     u = _u()
     access = await _alerts_access_state(cb.bot, user_id)
