@@ -239,6 +239,11 @@ async def welcome_menu_clean_thread(message: Message, state: FSMContext):
             shadow_surface,
         )
 
+    # ❌ НЕ РАБОТАЕМ В SUPPORT-ЧАТЕ
+    support_chat_id = int(os.getenv("SUPPORT_CHAT_ID", "0") or 0)
+    if support_chat_id and int(message.chat.id) == support_chat_id:
+        return
+
     if hint_text:
         log_event(
             logger,
