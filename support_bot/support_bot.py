@@ -66,10 +66,8 @@ support_cleanup_ids: dict[int, set[int]] = {}
 # Кнопки для поддерживаемых тем
 BUTTONS = [
     ("Проблемы с публикацией/размещением объявления", "publish_problem"),
-    ("Проблемы с поиском и фильтрами (soon)", "search_filters_problem"),
     ("Вопрос по работе с личными сообщениями", "dm_question"),
     ("Ошибка в получении уведомлений", "notification_error"),
-    ("Вопрос по управлению профилем (soon)", "profile_question_soon"),
     ("Проблемы отображения/поиска моих объявлений", "myads_problem"),
     ("Ошибка или баг в работе бота", "bot_error"),
     ("Вопросы по функциям сервиса", "service_feature_question"),
@@ -77,7 +75,7 @@ BUTTONS = [
     ("Другое", "other"),
 ]
 
-SOON_CALLBACKS = {"search_filters_problem", "profile_question_soon"}
+SOON_CALLBACKS = set()
 
 # callback_data для меню
 CB_MENU_START = "sb_menu_start"
@@ -654,9 +652,6 @@ async def support_start_menu_trash(message: Message, state: FSMContext):
 # -------------------------
 # остальная логика (без изменений)
 # -------------------------
-@dp.callback_query(F.data.in_(SOON_CALLBACKS))
-async def soon_callback(callback: types.CallbackQuery, state: FSMContext):
-    await callback.answer("Загрузка... Этот раздел пока в разработке.", show_alert=True)
 
 
 @dp.callback_query(F.data == "suggest_feature")
@@ -850,8 +845,13 @@ async def support_reply_callback(callback: CallbackQuery, state: FSMContext):
     ticket_id = int(parts[-2])
     user_id = int(parts[-1])
 
-    theme = user_last_question.get(user_id, {}).get("theme", "")
-    question = user_last_question.get(user_id, {}).get("text", "")
+    row = await fetch_ticket_by_id(ticket_id)
+    if not row:
+        await callback.answer("Тикет не найден.", show_alert=True)
+        return
+
+    theme = str(row["topic_title"] or "")
+    question = str(row["description"] or "")
 
     await state.set_state(SupportStates.reply_mode)
     await state.update_data(
@@ -859,19 +859,97 @@ async def support_reply_callback(callback: CallbackQuery, state: FSMContext):
         reply_ticket_id=ticket_id,
         reply_theme=theme,
         reply_question=question,
+        reply_support_chat_id=callback.message.chat.id if callback.message else None,
+        reply_support_message_id=callback.message.message_id if callback.message else None,
     )
 
-    preview = question.strip()
-    if len(preview) > 600:
-        preview = preview[:600] + "…"
+    if callback.message:
+        with contextlib.suppress(Exception):
+            await callback.message.edit_text(
+                render_support_group_card(row, active_reply=True),
+                reply_markup=support_group_card_kb(ticket_id, user_id, row["status"], active_reply=True),
+            )
 
-    await callback.message.reply(
-        f"✉️ Отправь следующее сообщение — и я отправлю его пользователю <code>{user_id}</code> в личку.\n\n"
-        f"<b>Заявка (цитата):</b>\n"
-        f"Тема: <b>{theme}</b>\n"
-        f"«{preview}»",
-    )
     await callback.answer()
+
+
+async def fetch_ticket_by_id(ticket_id: int):
+    if not _db_pool:
+        return None
+
+    async with _db_pool.acquire() as conn:
+        return await conn.fetchrow(
+            """
+            SELECT id, user_id, user_username, topic_title, description, status, created_at, closed_at, last_answer
+            FROM support_tickets
+            WHERE id = $1
+            LIMIT 1
+            """,
+            int(ticket_id),
+        )
+
+
+def _rec(row, key: str, default=None):
+    try:
+        return row[key]
+    except Exception:
+        return default
+
+
+def render_support_group_card(row, active_reply: bool = False) -> str:
+    status_raw = str(_rec(row, "status", "") or "").lower()
+    status = "✍️ Ответ набирается" if active_reply else ("✅ Закрыто" if status_raw == "closed" else "🟢 Открыто")
+
+    username = str(_rec(row, "user_username", "") or "").strip()
+    user_line = f"@{html.escape(username)}" if username else "[без username]"
+    created = _fmt_msk(_rec(row, "created_at")) if _rec(row, "created_at") else "—"
+    closed = _fmt_msk(_rec(row, "closed_at")) if _rec(row, "closed_at") else ""
+
+    topic = html.escape(str(_rec(row, "topic_title", "Без темы") or "Без темы"))
+    desc = html.escape(str(_rec(row, "description", "") or "").strip())
+    answer = html.escape(str(_rec(row, "last_answer", "") or "").strip())
+
+    lines = [
+        f"🆘 <b>Обращение #{_rec(row, 'id')}</b>",
+        "",
+        f"📊 <b>Статус:</b> {status}",
+        f"📅 <b>Создано:</b> {created} МСК",
+    ]
+
+    if closed:
+        lines.append(f"✅ <b>Закрыто:</b> {closed} МСК")
+
+    lines.extend([
+        "",
+        "👤 <b>Пользователь:</b>",
+        user_line,
+        f"id: <code>{_rec(row, 'user_id')}</code>",
+        "",
+        "📂 <b>Тема:</b>",
+        topic,
+        "",
+        "📝 <b>Запрос:</b>",
+        desc or "—",
+    ])
+
+    if answer:
+        lines.extend(["", "💬 <b>Ответ поддержки:</b>", answer])
+
+    return "\n".join(lines)
+
+
+def support_group_card_kb(ticket_id: int, user_id: int, status: str, active_reply: bool = False) -> InlineKeyboardMarkup:
+    if active_reply:
+        text = "✍️ Режим ответа включён — напиши текст в чат"
+        cb = "support_reply_active"
+    elif str(status or "").lower() == "closed":
+        text = "✅ Ответ отправлен"
+        cb = "support_reply_active"
+    else:
+        text = "💬 Ответить"
+        cb = f"support_reply_{int(ticket_id)}_{int(user_id)}"
+
+    return InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text=text, callback_data=cb)]])
 
 
 async def close_support_ticket(ticket_id: int | None, answer_text: str, actor_id: int | None = None):
@@ -895,7 +973,7 @@ async def close_support_ticket(ticket_id: int | None, answer_text: str, actor_id
         await conn.execute(
             """
             INSERT INTO support_ticket_events (ticket_id, event_type, actor_id, payload)
-            VALUES ($1, 'support_answered', $2, jsonb_build_object('answer', $3))
+            VALUES ($1, 'support_answered', $2, jsonb_build_object('answer', $3::text))
             """,
             int(ticket_id),
             actor_id,
@@ -929,23 +1007,39 @@ async def support_send_answer_to_user(message: Message, state: FSMContext):
         quote = quote[:800] + "…"
 
     out = (
-        f"📝 <b>Твой запрос</b> (тема: <b>{theme}</b>):\n"
-        f"«{quote}»\n\n"
+        f"📝 <b>Твой запрос</b> (тема: <b>{html.escape(str(theme))}</b>):\n"
+        f"«{html.escape(str(quote))}»\n\n"
         f"💬 <b>Ответ поддержки:</b>\n"
-        f"{support_text}"
+        f"{html.escape(str(support_text))}"
     )
 
     try:
         sent = await bot.send_message(user_id, out)
         await _track_cleanup_message(int(user_id), sent)
+
+        with contextlib.suppress(Exception):
+            await message.delete()
+
         await close_support_ticket(
             int(ticket_id) if ticket_id else None,
             support_text,
             int(message.from_user.id) if message.from_user else None,
         )
-        await message.reply("✅ Ответ отправлен пользователю в ЛС.")
+
+        support_chat_id = data.get("reply_support_chat_id")
+        support_message_id = data.get("reply_support_message_id")
+        if support_chat_id and support_message_id and ticket_id:
+            row = await fetch_ticket_by_id(int(ticket_id))
+            if row:
+                with contextlib.suppress(Exception):
+                    await bot.edit_message_text(
+                        chat_id=int(support_chat_id),
+                        message_id=int(support_message_id),
+                        text=render_support_group_card(row),
+                        reply_markup=support_group_card_kb(row["id"], row["user_id"], row["status"]),
+                    )
     except Exception as e:
-        await message.reply(f"❌ Ошибка отправки пользователю: <code>{e}</code>")
+        await message.reply(f"❌ Ошибка отправки пользователю: <code>{html.escape(str(e))}</code>")
     finally:
         await state.clear()
 
